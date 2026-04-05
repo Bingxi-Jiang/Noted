@@ -1,0 +1,7 @@
+numpy>=1.26
+soundcard>=0.4.3
+soundfile>=0.12.1
+openai>=1.75.0
+google-genai>=1.13.0
+anthropic>=0.50.0
+python-dotenv>=1.0.1
