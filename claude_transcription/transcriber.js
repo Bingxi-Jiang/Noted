@@ -1,11 +1,11 @@
-// transcriber.js — Deepgram real-time transcription bridge
+// transcriber.js — Deepgram real-time transcription bridge with diarization support
 import WebSocket from 'ws';
 
 const DEEPGRAM_WS_URL = 'wss://api.deepgram.com/v1/listen';
 
 /**
  * Creates a Deepgram streaming connection for a session.
- * Returns an object with methods to pipe audio and receive transcript events.
+ * Set diarize=true for meeting mode to get per-word speaker labels.
  */
 export function createTranscriber(apiKey, options = {}) {
   const {
@@ -13,10 +13,10 @@ export function createTranscriber(apiKey, options = {}) {
     language = 'en',
     smart_format = true,
     punctuate = true,
-    diarize = false,
-    interim_results = true,     // partial transcripts
-    utterance_end_ms = 1500,    // silence threshold for utterance boundary
-    vad_events = true,          // voice activity detection
+    diarize = false,            // Enable for meeting mode
+    interim_results = true,
+    utterance_end_ms = 1500,
+    vad_events = true,
     endpointing = 300,
   } = options;
 
@@ -52,7 +52,7 @@ export function createTranscriber(apiKey, options = {}) {
   };
 
   dgWs.on('open', () => {
-    console.log('[Deepgram] Connected');
+    console.log('[Deepgram] Connected (diarize:', diarize, ')');
     emitter.emit('open');
   });
 
@@ -72,17 +72,54 @@ export function createTranscriber(apiKey, options = {}) {
         }
 
         const transcript = alt.transcript;
-        if (!transcript) {
-          // Empty transcript = silence, this is normal
-          return;
-        }
+        if (!transcript) return;
 
         const isFinal = msg.is_final;
         const speechFinal = msg.speech_final;
         const start = msg.start ?? 0;
         const duration = msg.duration ?? 0;
         const words = alt.words ?? [];
-        const speaker = words[0]?.speaker ?? 0;
+
+        // When diarization is enabled, extract per-word speaker info
+        // Group consecutive words by speaker for better segmentation
+        let speaker = `speaker_${words[0]?.speaker ?? 0}`;
+
+        // For diarized results, build speaker segments from word-level data
+        let speakerSegments = null;
+        if (diarize && words.length > 0) {
+          speakerSegments = [];
+          let currentSeg = { speaker: words[0].speaker ?? 0, words: [words[0]] };
+          for (let i = 1; i < words.length; i++) {
+            const w = words[i];
+            const wSpeaker = w.speaker ?? 0;
+            if (wSpeaker === currentSeg.speaker) {
+              currentSeg.words.push(w);
+            } else {
+              speakerSegments.push({
+                speaker: `speaker_${currentSeg.speaker}`,
+                text: currentSeg.words.map(x => x.punctuated_word || x.word).join(' '),
+                start: currentSeg.words[0].start,
+                end: currentSeg.words[currentSeg.words.length - 1].end,
+              });
+              currentSeg = { speaker: wSpeaker, words: [w] };
+            }
+          }
+          speakerSegments.push({
+            speaker: `speaker_${currentSeg.speaker}`,
+            text: currentSeg.words.map(x => x.punctuated_word || x.word).join(' '),
+            start: currentSeg.words[0].start,
+            end: currentSeg.words[currentSeg.words.length - 1].end,
+          });
+
+          // Use the dominant speaker for the overall speaker label
+          const speakerCounts = {};
+          words.forEach(w => {
+            const s = w.speaker ?? 0;
+            speakerCounts[s] = (speakerCounts[s] || 0) + 1;
+          });
+          const dominant = Object.entries(speakerCounts).sort((a, b) => b[1] - a[1])[0];
+          speaker = `speaker_${dominant[0]}`;
+        }
 
         emitter.emit('transcript', {
           text: transcript,
@@ -91,9 +128,10 @@ export function createTranscriber(apiKey, options = {}) {
           start,
           end: start + duration,
           duration,
-          speaker: `speaker_${speaker}`,
+          speaker,
           words,
           confidence: alt.confidence ?? 0,
+          speakerSegments,
         });
 
         if (speechFinal) {
@@ -126,36 +164,26 @@ export function createTranscriber(apiKey, options = {}) {
   });
 
   return {
-    /** Send raw audio bytes to Deepgram */
     sendAudio(buffer) {
       if (dgWs.readyState === WebSocket.OPEN) {
         dgWs.send(buffer);
         audioBytesSent += buffer.byteLength;
-        if (audioBytesSent % (16000 * 2 * 5) < buffer.byteLength) { // log every ~5 seconds of audio
+        if (audioBytesSent % (16000 * 2 * 5) < buffer.byteLength) {
           console.log(`[Deepgram] Audio sent: ${(audioBytesSent / 1024).toFixed(0)}KB total, dgMsgs received: ${dgMsgCount}`);
         }
       } else {
-        // Log only occasionally to avoid spam
         if (audioBytesSent === 0) {
           console.warn('[Deepgram] sendAudio called but WS not open, readyState:', dgWs.readyState);
         }
       }
     },
-
-    /** Gracefully close the Deepgram connection */
     close() {
       if (dgWs.readyState === WebSocket.OPEN) {
         dgWs.send(JSON.stringify({ type: 'CloseStream' }));
         dgWs.close();
       }
     },
-
-    /** Check if connected */
-    get isOpen() {
-      return dgWs.readyState === WebSocket.OPEN;
-    },
-
-    /** Event emitter */
+    get isOpen() { return dgWs.readyState === WebSocket.OPEN; },
     on: emitter.on.bind(emitter),
   };
 }

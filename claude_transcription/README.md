@@ -122,3 +122,11 @@ Connect to `ws://localhost:3000/ws`
 - Audio is processed as PCM 16-bit, 16kHz mono (browser does conversion)
 - Deepgram Nova-2 model is used by default (best accuracy/speed)
 - Summaries use Claude claude-sonnet-4-20250514 via Anthropic API
+---
+## Todo List
+
+- [ ] Lecture mode using mic
+- [ ] Meeting mode default name is "speaker 2"
+- [ ] Chinese words in Meeting notes
+- [ ] Latex not displaying in notes
+ 

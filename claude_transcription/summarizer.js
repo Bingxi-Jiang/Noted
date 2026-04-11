@@ -1,4 +1,4 @@
-// summarizer.js — Summaries, Q&A, note generation, auto-titling via Gemini 3 Flash
+// summarizer.js — Summaries, Q&A, note generation, auto-titling via Gemini
 
 const GEMINI_MODEL = 'gemini-3-flash-preview';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
@@ -125,7 +125,7 @@ Respond with JSON only using this schema:
   });
 }
 
-// ── Q&A (single session or cross-session) ──
+// ── Q&A ──
 export async function answerQuestion(apiKey, question, relevantChunks, summaries = [], crossSession = false) {
   const context = relevantChunks.map(c => {
     const mins = Math.floor(c.start_time / 60);
@@ -173,6 +173,7 @@ export async function generateSessionTitle(apiKey, chunks) {
 const NOTE_METHODS = {
   cornell: {
     name: 'Cornell Method',
+    mode: 'lecture',
     system: `You are an expert note-taker using the Cornell Method. Structure notes as follows:
 
 ## [Title]
@@ -197,6 +198,7 @@ Keep notes concise. Use timestamps where relevant. Focus on main ideas, definiti
 
   outline: {
     name: 'Outline Method',
+    mode: 'lecture',
     system: `You are an expert note-taker using the Outline Method. Structure notes hierarchically:
 
 ## [Title]
@@ -220,18 +222,65 @@ List any important terms and their definitions.
 
 Keep it scannable. Use timestamps for key moments. Focus on hierarchy and relationships between concepts.`
   },
+
+  meeting: {
+    name: 'Meeting Minutes',
+    mode: 'meeting',
+    system: `You are an expert meeting note-taker. Generate meeting notes in the following format. Output in the SAME LANGUAGE as the transcript (if the transcript is in Chinese, output Chinese; if English, output English).
+
+## Meeting Overview (全文概要)
+A comprehensive summary of the entire meeting in 4-8 sentences. Cover the purpose, main discussion points, key decisions made, and overall outcome.
+
+---
+
+## Section Overview (章节速览)
+Break the meeting into logical sections/topics that were discussed. For each section:
+
+### [Section Title]
+**Time Range:** [start] - [end]
+**Participants:** [who spoke in this section]
+
+**Key Points:**
+- Bullet point summaries of what was discussed
+- Include who said what when relevant (e.g., "Paul suggested..." or "Speaker 1 mentioned...")
+- Note any decisions made
+- Note any action items assigned
+
+**Disagreements / Open Questions:**
+- Any unresolved items or different opinions expressed
+
+---
+
+### Action Items (待办事项)
+Consolidate all action items from the meeting:
+- [ ] [Action item] — assigned to [person], deadline: [if mentioned]
+
+### Decisions Made (决定事项)
+List all decisions reached during the meeting.
+
+Use speaker names where available. Reference timestamps. Be thorough but concise.`
+  },
 };
 
-export function getNoteMethods() {
-  return Object.entries(NOTE_METHODS).map(([id, m]) => ({ id, name: m.name }));
+export function getNoteMethods(mode = null) {
+  if (mode) {
+    return Object.entries(NOTE_METHODS)
+      .filter(([, m]) => m.mode === mode)
+      .map(([id, m]) => ({ id, name: m.name }));
+  }
+  return Object.entries(NOTE_METHODS).map(([id, m]) => ({ id, name: m.name, mode: m.mode }));
 }
 
-export async function generateNotes(apiKey, chunks, summaries = [], method = 'cornell') {
+export async function generateNotes(apiKey, chunks, summaries = [], method = 'cornell', speakerNameMap = {}) {
   const config = NOTE_METHODS[method] || NOTE_METHODS.cornell;
 
   const transcript = chunks.map(c => {
     const mins = Math.floor(c.start_time / 60);
     const secs = Math.floor(c.start_time % 60);
+    const speakerLabel = speakerNameMap[c.speaker] || c.speaker;
+    if (method === 'meeting') {
+      return `[${mins}:${String(secs).padStart(2, '0')}] [${speakerLabel}] ${c.text}`;
+    }
     return `[${mins}:${String(secs).padStart(2, '0')}] ${c.text}`;
   }).join('\n');
 
@@ -239,7 +288,15 @@ export async function generateNotes(apiKey, chunks, summaries = [], method = 'co
     ? '\n\nExisting summaries (for reference):\n' + summaries.map(s => s.summary_text).join('\n\n')
     : '';
 
-  const prompt = `Generate comprehensive notes from this lecture or meeting transcript.${summaryCtx}\n\nFull transcript:\n${transcript}`;
+  let prompt;
+  if (method === 'meeting') {
+    const speakerInfo = Object.keys(speakerNameMap).length > 0
+      ? '\n\nSpeaker name mapping:\n' + Object.entries(speakerNameMap).map(([k, v]) => `${k} = ${v}`).join('\n')
+      : '';
+    prompt = `Generate comprehensive meeting notes from this transcript.${speakerInfo}${summaryCtx}\n\nFull transcript:\n${transcript}`;
+  } else {
+    prompt = `Generate comprehensive notes from this lecture transcript.${summaryCtx}\n\nFull transcript:\n${transcript}`;
+  }
 
   return callGemini(apiKey, config.system, prompt, {
     maxOutputTokens: 4096,

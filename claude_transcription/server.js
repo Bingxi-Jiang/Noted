@@ -1,4 +1,4 @@
-// server.js — Express + WebSocket server with folders, sessions, notes
+// server.js — Express + WebSocket server with folders, sessions, modes, speaker names, notes
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
@@ -13,7 +13,8 @@ import {
   insertChunk, getChunks, getAllChunks, getRecentChunks, searchChunks, searchChunksInFolder,
   getFolderChunks, getFolderSummaries,
   insertSummary, getSummaries, getLatestSummary,
-  upsertNote, getNote, updateNoteContent
+  upsertNote, getNote, updateNoteContent,
+  getSpeakerNames, upsertSpeakerName, getSpeakerNameMap,
 } from './db.js';
 import { createTranscriber } from './transcriber.js';
 import {
@@ -64,7 +65,8 @@ app.get('/api/sessions/grouped', (req, res) => res.json(listSessionsByFolder()))
 app.post('/api/sessions', (req, res) => {
   const id = uuid();
   const title = req.body.title || `Session ${new Date().toLocaleString()}`;
-  res.json(createSession(id, title, req.body.folder_id || null));
+  const mode = req.body.mode || 'lecture';
+  res.json(createSession(id, title, req.body.folder_id || null, mode));
 });
 app.get('/api/sessions/:id', (req, res) => {
   const s = getSession(req.params.id);
@@ -80,11 +82,30 @@ app.delete('/api/sessions/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// ══════════════ Speaker Names API ══════════════
+app.get('/api/sessions/:id/speakers', (req, res) => {
+  res.json(getSpeakerNames(req.params.id));
+});
+app.put('/api/sessions/:id/speakers/:key', (req, res) => {
+  const { display_name } = req.body;
+  if (!display_name) return res.status(400).json({ error: 'display_name required' });
+  upsertSpeakerName(req.params.id, req.params.key, display_name);
+  // Broadcast speaker name change to active clients
+  broadcastToSession(req.params.id, {
+    type: 'speaker_renamed',
+    data: { speaker_key: req.params.key, display_name }
+  });
+  res.json({ ok: true });
+});
+app.get('/api/sessions/:id/speaker-map', (req, res) => {
+  res.json(getSpeakerNameMap(req.params.id));
+});
+
 // ══════════════ Transcript API ══════════════
 app.get('/api/sessions/:id/chunks', (req, res) => res.json(getAllChunks(req.params.id)));
 app.get('/api/sessions/:id/summaries', (req, res) => res.json(getSummaries(req.params.id)));
 
-// ══════════════ Q&A (single session) ══════════════
+// ══════════════ Q&A ══════════════
 app.post('/api/sessions/:id/ask', async (req, res) => {
   const { question } = req.body;
   if (!question) return res.status(400).json({ error: 'question required' });
@@ -92,7 +113,6 @@ app.post('/api/sessions/:id/ask', async (req, res) => {
   try {
     const sid = req.params.id;
     const session = getSession(sid);
-    // If session is in a folder, search across all sessions in folder
     let context, summaries, crossSession = false;
     if (session?.folder_id) {
       context = searchChunksInFolder(session.folder_id, question);
@@ -115,7 +135,6 @@ app.post('/api/sessions/:id/ask', async (req, res) => {
   }
 });
 
-// ══════════════ Folder-level Q&A ══════════════
 app.post('/api/folders/:id/ask', async (req, res) => {
   const { question } = req.body;
   if (!question) return res.status(400).json({ error: 'question required' });
@@ -156,7 +175,10 @@ app.post('/api/sessions/:id/summarize', async (req, res) => {
 });
 
 // ══════════════ Notes API ══════════════
-app.get('/api/note-methods', (req, res) => res.json(getNoteMethods()));
+app.get('/api/note-methods', (req, res) => {
+  const mode = req.query.mode || null;
+  res.json(getNoteMethods(mode));
+});
 
 app.get('/api/sessions/:id/notes', (req, res) => {
   const note = getNote(req.params.id);
@@ -167,11 +189,18 @@ app.post('/api/sessions/:id/notes/generate', async (req, res) => {
   if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
   try {
     const sid = req.params.id;
-    const method = req.body.method || 'cornell';
+    const session = getSession(sid);
+    const sessionMode = session?.mode || 'lecture';
+    // Use the method from request, or default based on session mode
+    let method = req.body.method;
+    if (!method) {
+      method = sessionMode === 'meeting' ? 'meeting' : 'cornell';
+    }
     const chunks = getAllChunks(sid);
     if (chunks.length === 0) return res.status(400).json({ error: 'No transcript data' });
     const summaries = getSummaries(sid);
-    const content = await generateNotes(GEMINI_KEY, chunks, summaries, method);
+    const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sid) : {};
+    const content = await generateNotes(GEMINI_KEY, chunks, summaries, method, speakerNameMap);
     const noteId = uuid();
     upsertNote(noteId, sid, method, content);
     res.json({ id: noteId, session_id: sid, method, content });
@@ -224,12 +253,14 @@ wss.on('connection', (ws) => {
 
       if (msg.type === 'start_session') {
         sessionId = msg.session_id;
+        const sessionMode = msg.session_mode || 'lecture';
         if (!activeSessions.has(sessionId)) {
           activeSessions.set(sessionId, {
             clients: new Set(), transcriber: null,
             lastSummaryTime: 0, currentTopic: '', chunkCount: 0,
             summaryMode: msg.summary_mode || 'time',
             summaryInterval: msg.summary_interval || 5,
+            sessionMode,
           });
         }
         const session = activeSessions.get(sessionId);
@@ -238,20 +269,59 @@ wss.on('connection', (ws) => {
         session.summaryInterval = msg.summary_interval || session.summaryInterval;
 
         if (!session.transcriber && DEEPGRAM_KEY) {
-          transcriber = createTranscriber(DEEPGRAM_KEY, { interim_results: true, smart_format: true, utterance_end_ms: 1500 });
+          // Enable diarization for meeting mode
+          const useDiarize = sessionMode === 'meeting';
+          transcriber = createTranscriber(DEEPGRAM_KEY, {
+            interim_results: true,
+            smart_format: true,
+            utterance_end_ms: 1500,
+            diarize: useDiarize,
+          });
           session.transcriber = transcriber;
 
           transcriber.on('open', () => {
-            console.log('[WS] Deepgram ready');
+            console.log('[WS] Deepgram ready (mode:', sessionMode, ')');
             ws.send(JSON.stringify({ type: 'session_ready', session_id: sessionId }));
           });
           transcriber.on('transcript', async (data) => {
             broadcastToSession(sessionId, {
               type: data.is_final ? 'final_transcript' : 'partial_transcript',
-              data: { text: data.text, start: data.start, end: data.end, speaker: data.speaker, confidence: data.confidence, is_final: data.is_final, speech_final: data.speech_final },
+              data: {
+                text: data.text,
+                start: data.start,
+                end: data.end,
+                speaker: data.speaker,
+                confidence: data.confidence,
+                is_final: data.is_final,
+                speech_final: data.speech_final,
+                speakerSegments: data.speakerSegments || null,
+              },
             });
             if (data.is_final && data.text.trim()) {
-              insertChunk(sessionId, data.text, data.start, data.end, data.speaker);
+              // For meeting mode with diarization, store segments individually if available
+              if (useDiarize && data.speakerSegments && data.speakerSegments.length > 1) {
+                for (const seg of data.speakerSegments) {
+                  if (seg.text.trim()) {
+                    insertChunk(sessionId, seg.text, seg.start, seg.end, seg.speaker);
+                    // Auto-register speaker names
+                    const existing = getSpeakerNameMap(sessionId);
+                    if (!existing[seg.speaker]) {
+                      const num = parseInt(seg.speaker.replace('speaker_', ''), 10);
+                      upsertSpeakerName(sessionId, seg.speaker, `Speaker ${num + 1}`);
+                    }
+                  }
+                }
+              } else {
+                insertChunk(sessionId, data.text, data.start, data.end, data.speaker);
+                // Auto-register speaker name for meeting mode
+                if (useDiarize) {
+                  const existing = getSpeakerNameMap(sessionId);
+                  if (!existing[data.speaker]) {
+                    const num = parseInt(data.speaker.replace('speaker_', ''), 10);
+                    upsertSpeakerName(sessionId, data.speaker, `Speaker ${num + 1}`);
+                  }
+                }
+              }
               session.chunkCount++;
               await maybeAutoSummarize(sessionId, session, data.end);
             }
@@ -325,11 +395,12 @@ function stopSession(sessionId) {
   if (session.transcriber) { session.transcriber.close(); session.transcriber = null; }
   broadcastToSession(sessionId, { type: 'session_stopped', data: {} });
 
-  // Auto-generate title and notes after stopping
   if (GEMINI_KEY) {
     const chunks = getAllChunks(sessionId);
     if (chunks.length > 0) {
       const dbSession = getSession(sessionId);
+      const sessionMode = dbSession?.mode || 'lecture';
+
       // Auto-title if still default name
       if (dbSession?.title?.startsWith('Session ')) {
         generateSessionTitle(GEMINI_KEY, chunks).then(title => {
@@ -339,12 +410,15 @@ function stopSession(sessionId) {
       } else {
         updateSession(sessionId, { status: 'completed' });
       }
-      // Auto-generate notes
+
+      // Auto-generate notes with mode-appropriate method
       const summaries = getSummaries(sessionId);
-      generateNotes(GEMINI_KEY, chunks, summaries, 'cornell').then(content => {
+      const defaultMethod = sessionMode === 'meeting' ? 'meeting' : 'cornell';
+      const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sessionId) : {};
+      generateNotes(GEMINI_KEY, chunks, summaries, defaultMethod, speakerNameMap).then(content => {
         const noteId = uuid();
-        upsertNote(noteId, sessionId, 'cornell', content);
-        broadcastToSession(sessionId, { type: 'notes_generated', data: { id: noteId, method: 'cornell', content } });
+        upsertNote(noteId, sessionId, defaultMethod, content);
+        broadcastToSession(sessionId, { type: 'notes_generated', data: { id: noteId, method: defaultMethod, content } });
       }).catch(e => console.error('[AutoNotes]', e.message));
     }
   }

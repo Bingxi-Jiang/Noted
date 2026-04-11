@@ -25,10 +25,13 @@
   --orange-dim: #fb923c22;
   --red: #f87171;
   --cyan: #22d3ee;
+  --blue: #60a5fa;
+  --pink: #f472b6;
+  --yellow: #fbbf24;
   --mono: 'JetBrains Mono', monospace;
   --sans: 'DM Sans', sans-serif;
   --sidebar-w: 280px;
-  --notes-w: 360px;
+  --notes-w: 380px;
 }
 * { margin:0; padding:0; box-sizing:border-box; }
 body { background:var(--bg); color:var(--text); font-family:var(--sans); height:100vh; overflow:hidden; }
@@ -101,6 +104,12 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .session-item .s-dot.completed { background:var(--accent); }
 .session-item .s-title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .session-item .s-time { font-family:var(--mono); font-size:10px; color:var(--text-muted); }
+.session-item .s-mode {
+  font-family:var(--mono); font-size:9px; padding:1px 5px; border-radius:3px;
+  text-transform:uppercase; letter-spacing:.3px;
+}
+.session-item .s-mode.lecture { background:var(--accent-dim); color:var(--accent); }
+.session-item .s-mode.meeting { background:var(--orange-dim); color:var(--orange); }
 
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
@@ -115,7 +124,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 /* ── Top bar ── */
 .topbar {
   height:48px; background:var(--surface); border-bottom:1px solid var(--border);
-  display:flex; align-items:center; padding:0 16px; gap:12px; flex-shrink:0;
+  display:flex; align-items:center; padding:0 16px; gap:10px; flex-shrink:0;
 }
 .topbar .session-name {
   font-size:14px; font-weight:500; flex:1; overflow:hidden;
@@ -133,6 +142,14 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .rec-badge.recording .dot { background:var(--green); animation:pulse 1.5s infinite; }
 .rec-badge.idle .dot { background:var(--text-muted); }
 .rec-time { font-family:var(--mono); font-size:12px; color:var(--text-dim); }
+
+/* Mode badge in topbar */
+.mode-badge {
+  font-family:var(--mono); font-size:10px; padding:3px 10px; border-radius:100px;
+  text-transform:uppercase; letter-spacing:.5px; font-weight:600;
+}
+.mode-badge.lecture { background:var(--accent-dim); color:var(--accent); }
+.mode-badge.meeting { background:var(--orange-dim); color:var(--orange); }
 
 /* Audio source toggle */
 .src-toggle {
@@ -157,8 +174,10 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .btn.primary:hover { filter:brightness(1.15); }
 .btn.stop { border-color:var(--red); color:var(--red); }
 .btn.stop:hover { background:#f8717115; }
+.btn.meeting-btn { border-color:var(--orange); color:var(--orange); }
+.btn.meeting-btn:hover { background:var(--orange-dim); }
 
-/* ── Main content area (transcript + notes) ── */
+/* ── Main content area ── */
 .content-area { flex:1; display:flex; overflow:hidden; }
 
 /* ── Home screen ── */
@@ -167,13 +186,22 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 }
 .home-view .hero-icon { font-size:64px; opacity:.25; }
 .home-view h2 { font-size:20px; font-weight:600; color:var(--text-dim); }
-.home-view p { font-size:14px; color:var(--text-muted); text-align:center; max-width:400px; line-height:1.6; }
-.home-view .start-btn {
-  padding:12px 36px; border-radius:8px; background:var(--accent); border:none;
-  color:#fff; font-family:var(--sans); font-size:15px; font-weight:600;
-  cursor:pointer; transition:all .15s;
+.home-view p { font-size:14px; color:var(--text-muted); text-align:center; max-width:440px; line-height:1.6; }
+
+/* Mode selector on home */
+.mode-selector {
+  display:flex; gap:16px; margin-top:8px;
 }
-.home-view .start-btn:hover { filter:brightness(1.15); transform:translateY(-1px); }
+.mode-card {
+  width:200px; padding:20px; border-radius:12px; border:2px solid var(--border);
+  background:var(--surface); cursor:pointer; transition:all .2s; text-align:center;
+}
+.mode-card:hover { border-color:var(--accent); background:var(--surface-2); transform:translateY(-2px); }
+.mode-card.lecture:hover { border-color:var(--accent); }
+.mode-card.meeting:hover { border-color:var(--orange); }
+.mode-card .mc-icon { font-size:32px; margin-bottom:8px; }
+.mode-card .mc-title { font-size:15px; font-weight:600; margin-bottom:4px; }
+.mode-card .mc-desc { font-size:12px; color:var(--text-muted); line-height:1.4; }
 
 /* ── Transcript panel ── */
 .transcript-panel { flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0; }
@@ -213,7 +241,35 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .t-text { font-size:13px; line-height:1.5; }
 .t-entry.partial .t-text { color:var(--text-dim); font-style:italic; }
 
-/* Q&A bar at bottom of transcript */
+/* Speaker label in transcript */
+.t-speaker {
+  font-family:var(--mono); font-size:10px; padding:1px 6px; border-radius:3px;
+  font-weight:600; cursor:pointer; transition:opacity .15s;
+}
+.t-speaker:hover { opacity:.8; }
+
+/* Speaker colors */
+.spk-0 { background:#7c6cf022; color:#a78bfa; }
+.spk-1 { background:#f472b622; color:#f472b6; }
+.spk-2 { background:#34d39922; color:#34d399; }
+.spk-3 { background:#fbbf2422; color:#fbbf24; }
+.spk-4 { background:#60a5fa22; color:#60a5fa; }
+.spk-5 { background:#fb923c22; color:#fb923c; }
+.spk-6 { background:#22d3ee22; color:#22d3ee; }
+.spk-7 { background:#e879f922; color:#e879f9; }
+
+/* Mic toggle for lecture mode */
+.mic-toggle {
+  display:flex; align-items:center; gap:6px; padding:4px 10px;
+  border-radius:6px; border:1px solid var(--border); background:var(--surface-2);
+  font-family:var(--mono); font-size:10px; color:var(--text-muted); cursor:pointer;
+  transition:all .15s;
+}
+.mic-toggle:hover { border-color:var(--green); color:var(--green); }
+.mic-toggle.active { border-color:var(--green); background:var(--green-dim); color:var(--green); }
+.mic-toggle svg { width:12px; height:12px; }
+
+/* Q&A bar */
 .qa-bar {
   padding:8px 16px; background:var(--surface); border-top:1px solid var(--border);
   display:flex; gap:8px;
@@ -225,7 +281,6 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .qa-bar input::placeholder { color:var(--text-muted); }
 .qa-bar input:focus { outline:none; border-color:var(--accent); }
 
-/* Q&A result overlay */
 .qa-result {
   padding:10px 16px; background:var(--surface-2); border-top:1px solid var(--border);
   max-height:200px; overflow-y:auto; font-size:13px; line-height:1.6;
@@ -269,7 +324,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
   padding:8px 14px; border-top:1px solid var(--border); display:flex; gap:6px;
 }
 
-/* ── Summary cards (in sidebar or panel) ── */
+/* ── Summary cards ── */
 .summary-section { padding:8px; }
 .summary-card {
   background:var(--surface-2); border:1px solid var(--border); border-radius:6px;
@@ -291,7 +346,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .modal-overlay.hidden { display:none; }
 .modal {
   background:var(--surface); border:1px solid var(--border); border-radius:10px;
-  padding:20px; min-width:340px; max-width:420px;
+  padding:20px; min-width:340px; max-width:460px;
 }
 .modal h3 { font-size:15px; margin-bottom:12px; }
 .modal input, .modal select {
@@ -308,6 +363,21 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
   transition:all .12s;
 }
 .color-opt:hover, .color-opt.active { border-color:var(--text); transform:scale(1.15); }
+
+/* Speaker list in modal */
+.speaker-list { max-height:300px; overflow-y:auto; }
+.speaker-row {
+  display:flex; align-items:center; gap:8px; padding:6px 0;
+  border-bottom:1px solid var(--border);
+}
+.speaker-row:last-child { border-bottom:none; }
+.speaker-row .spk-badge {
+  font-family:var(--mono); font-size:10px; padding:2px 8px; border-radius:4px;
+  font-weight:600; min-width:70px; text-align:center;
+}
+.speaker-row input {
+  flex:1; margin-bottom:0;
+}
 
 /* ── Spinner ── */
 .spinner {
@@ -348,7 +418,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       </button>
     </div>
     <div class="sidebar-actions">
-      <button class="action-btn primary" onclick="newRecording()">＋ New Recording</button>
+      <button class="action-btn primary" onclick="showModeChooser()">＋ New Recording</button>
     </div>
     <div class="sidebar-scroll" id="sidebarList"></div>
   </div>
@@ -357,15 +427,19 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
   <div class="main">
     <div class="topbar" id="topbar">
       <span class="session-name" id="topTitle">SCRIBE</span>
+      <span class="mode-badge" id="modeBadge" style="display:none"></span>
       <span class="rec-time" id="recTime" style="display:none">00:00</span>
       <div class="rec-badge idle" id="recBadge" style="display:none">
         <span class="dot"></span><span id="recStatus">Idle</span>
       </div>
+      <!-- Lecture mode: system audio primary, optional mic -->
       <div class="src-toggle" id="srcToggle" style="display:none">
         <button class="active" onclick="selectSource('mic',this)">Mic</button>
         <button onclick="selectSource('system',this)">System</button>
         <button onclick="selectSource('both',this)">Both</button>
       </div>
+      <!-- Meeting mode: speakers button -->
+      <button class="btn meeting-btn" id="btnSpeakers" style="display:none" onclick="showSpeakerModal()">👥 Speakers</button>
       <button class="btn primary" id="btnRec" style="display:none" onclick="startRecording()">Record</button>
       <button class="btn stop" id="btnStop" style="display:none" onclick="stopRecording()">Stop</button>
       <button class="btn" id="btnNotes" style="display:none" onclick="toggleNotes()">Notes</button>
@@ -376,14 +450,25 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       <div class="home-view" id="homeView">
         <div class="hero-icon">🎙️</div>
         <h2>Ready to capture</h2>
-        <p>Start a new recording session or select an existing one from the sidebar. Transcripts, summaries, and notes are generated automatically.</p>
-        <button class="start-btn" onclick="newRecording()">Start Recording</button>
+        <p>Choose a mode to start recording. Lecture mode focuses on note-taking from system audio. Meeting mode identifies different speakers.</p>
+        <div class="mode-selector">
+          <div class="mode-card lecture" onclick="newRecording(null,'lecture')">
+            <div class="mc-icon">📚</div>
+            <div class="mc-title">Lecture Mode</div>
+            <div class="mc-desc">System audio capture with deep concept notes (Cornell / Outline)</div>
+          </div>
+          <div class="mode-card meeting" onclick="newRecording(null,'meeting')">
+            <div class="mc-icon">🤝</div>
+            <div class="mc-title">Meeting Mode</div>
+            <div class="mc-desc">Speaker diarization with per-person tracking & meeting minutes</div>
+          </div>
+        </div>
       </div>
 
       <!-- Session view (hidden by default) -->
       <div class="transcript-panel" id="transcriptPanel" style="display:none">
         <div class="transcript-toolbar">
-          <h3>Transcript</h3>
+          <h3 id="transcriptTitle">Transcript</h3>
           <div style="display:flex;gap:6px">
             <button class="btn" onclick="triggerSummary()" title="Generate summary now" style="font-size:10px">Summarize</button>
             <select id="summaryMode" onchange="updateSettings()" style="padding:3px 6px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:10px">
@@ -404,7 +489,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
           <div id="qaResultContent"></div>
         </div>
         <div class="qa-bar">
-          <input type="text" id="qaInput" placeholder="Ask about this session (cross-session if in folder)..." onkeydown="if(event.key==='Enter')askQuestion()">
+          <input type="text" id="qaInput" placeholder="Ask about this session..." onkeydown="if(event.key==='Enter')askQuestion()">
           <button class="btn primary" onclick="askQuestion()">Ask</button>
         </div>
       </div>
@@ -413,10 +498,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       <div class="notes-panel hidden" id="notesPanel">
         <div class="notes-header">
           <h3>Notes</h3>
-          <select class="notes-method-select" id="noteMethod">
-            <option value="cornell">Cornell Method</option>
-            <option value="outline">Outline Method</option>
-          </select>
+          <select class="notes-method-select" id="noteMethod"></select>
           <button class="btn" onclick="generateNotes()" style="font-size:10px">Generate</button>
         </div>
         <div class="notes-content" id="notesContent">
@@ -465,6 +547,44 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
   </div>
 </div>
 
+<!-- Speaker Names Modal -->
+<div class="modal-overlay hidden" id="speakerModal">
+  <div class="modal" style="min-width:380px">
+    <h3>👥 Manage Speakers</h3>
+    <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Rename speakers to track who said what. Changes apply to all past and future transcripts.</p>
+    <div class="speaker-list" id="speakerList">
+      <div class="empty-msg" style="padding:20px"><div class="em-icon">🎤</div>No speakers detected yet. Start recording to detect speakers.</div>
+    </div>
+    <div class="modal-actions" style="margin-top:12px">
+      <button class="btn" onclick="closeSpeakerModal()">Close</button>
+      <button class="btn primary" onclick="saveSpeakerNames()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Mode chooser modal for creating recording in a folder -->
+<div class="modal-overlay hidden" id="modeChooserModal">
+  <div class="modal" style="min-width:380px">
+    <h3>New Recording</h3>
+    <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px">Choose a recording mode:</p>
+    <div style="display:flex;gap:10px;margin-bottom:14px">
+      <div class="mode-card lecture" onclick="confirmModeChooser('lecture')" style="flex:1;padding:14px">
+        <div class="mc-icon" style="font-size:24px">📚</div>
+        <div class="mc-title" style="font-size:13px">Lecture</div>
+        <div class="mc-desc" style="font-size:11px">System audio + notes</div>
+      </div>
+      <div class="mode-card meeting" onclick="confirmModeChooser('meeting')" style="flex:1;padding:14px">
+        <div class="mc-icon" style="font-size:24px">🤝</div>
+        <div class="mc-title" style="font-size:13px">Meeting</div>
+        <div class="mc-desc" style="font-size:11px">Speaker diarization</div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModeChooser()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- Context menu -->
 <div class="ctx-menu" id="ctxMenu"></div>
 
@@ -475,11 +595,16 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 let ws = null, audioContext = null, sessionId = null, isRecording = false;
 let startTimestamp = null, timerInterval = null;
 let selectedSource = 'mic', activeStreams = [];
-let currentView = 'split', currentPartialText = '';
+let currentView = 'split', currentPartialText = '', currentPartialSpeaker = 'speaker_0';
 const finals = [], summaries = [];
 let folders = [], sessions = [];
-let activeSessionId = null; // currently viewed session
+let activeSessionId = null;
 let notesVisible = false;
+let currentSessionMode = 'lecture'; // 'lecture' or 'meeting'
+let speakerNameMap = {}; // { speaker_0: 'Paul', speaker_1: 'Lisa', ... }
+let modeChooserFolderId = null;
+
+const SPEAKER_COLORS = ['spk-0','spk-1','spk-2','spk-3','spk-4','spk-5','spk-6','spk-7'];
 
 // ══════════════════════════════════════════════════════
 //  Init
@@ -490,7 +615,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ══════════════════════════════════════════════════════
-//  Sidebar: load folders + sessions
+//  Sidebar
 // ══════════════════════════════════════════════════════
 async function loadSidebar() {
   const [fRes, sRes] = await Promise.all([fetch('/api/folders'), fetch('/api/sessions')]);
@@ -529,7 +654,7 @@ function renderSidebar() {
   }
 
   if (folders.length === 0 && sessions.length === 0) {
-    html = `<div class="empty-msg"><div class="em-icon">📂</div>No sessions yet.<br>Click "New Recording" to start.</div>`;
+    html = `<div class="empty-msg"><div class="em-icon">📂</div>No sessions yet.<br>Choose a mode to start.</div>`;
   }
   el.innerHTML = html;
 }
@@ -538,17 +663,20 @@ function sessionItemHtml(s) {
   const isActive = s.id === activeSessionId;
   const isRec = activeSessions_client.has(s.id);
   const dotClass = isRec ? 'recording' : (s.status === 'completed' ? 'completed' : '');
+  const mode = s.mode || 'lecture';
+  const modeLabel = mode === 'meeting' ? 'MTG' : 'LEC';
+  const modeClass = mode === 'meeting' ? 'meeting' : 'lecture';
   return `<div class="session-item ${isActive?'active':''}" onclick="openSession('${s.id}')" oncontextmenu="showSessionCtx(event,'${s.id}')">
     <span class="s-dot ${dotClass}"></span>
     <span class="s-title">${esc(s.title||'Untitled')}</span>
+    <span class="s-mode ${modeClass}">${modeLabel}</span>
   </div>`;
 }
 const activeSessions_client = new Set();
 
 function toggleFolder(el) {
   el.classList.toggle('expanded');
-  const next = el.nextElementSibling;
-  next.classList.toggle('show');
+  el.nextElementSibling.classList.toggle('show');
 }
 
 // ══════════════════════════════════════════════════════
@@ -559,14 +687,19 @@ async function openSession(sid) {
   finals.length = 0;
   summaries.length = 0;
   currentPartialText = '';
+  currentPartialSpeaker = 'speaker_0';
+  speakerNameMap = {};
 
-  // Load session data
-  const [session, chunks, sums, note] = await Promise.all([
+  const [session, chunks, sums, note, spkMap] = await Promise.all([
     fetch(`/api/sessions/${sid}`).then(r=>r.json()),
     fetch(`/api/sessions/${sid}/chunks`).then(r=>r.json()),
     fetch(`/api/sessions/${sid}/summaries`).then(r=>r.json()),
     fetch(`/api/sessions/${sid}/notes`).then(r=>r.json()),
+    fetch(`/api/sessions/${sid}/speaker-map`).then(r=>r.json()),
   ]);
+
+  currentSessionMode = session.mode || 'lecture';
+  speakerNameMap = spkMap || {};
 
   chunks.forEach(c => finals.push({ text:c.text, start:c.start_time, end:c.end_time, speaker:c.speaker }));
   sums.forEach(s => summaries.push(s));
@@ -577,37 +710,89 @@ async function openSession(sid) {
   document.getElementById('topTitle').textContent = session.title || 'Untitled';
   document.getElementById('topTitle').className = 'session-name editable';
   document.getElementById('topTitle').onclick = () => renameSession(sid);
+
+  // Mode badge
+  const badge = document.getElementById('modeBadge');
+  badge.style.display = '';
+  badge.textContent = currentSessionMode === 'meeting' ? '🤝 Meeting' : '📚 Lecture';
+  badge.className = 'mode-badge ' + currentSessionMode;
+
+  // Show/hide mode-specific controls
   document.getElementById('btnNotes').style.display = '';
-  document.getElementById('srcToggle').style.display = '';
   document.getElementById('btnRec').style.display = '';
   document.getElementById('btnStop').style.display = 'none';
   document.getElementById('recBadge').style.display = '';
   document.getElementById('recTime').style.display = '';
+
+  if (currentSessionMode === 'lecture') {
+    document.getElementById('srcToggle').style.display = '';
+    document.getElementById('btnSpeakers').style.display = 'none';
+    // Default to system audio for lecture mode
+    selectedSource = 'system';
+    document.querySelectorAll('.src-toggle button').forEach(b => {
+      b.classList.toggle('active', b.textContent === 'System');
+    });
+  } else {
+    document.getElementById('srcToggle').style.display = '';
+    document.getElementById('btnSpeakers').style.display = '';
+    selectedSource = 'mic';
+    document.querySelectorAll('.src-toggle button').forEach(b => {
+      b.classList.toggle('active', b.textContent === 'Mic');
+    });
+  }
+
   sessionId = sid;
+
+  // Update note methods for mode
+  updateNoteMethodOptions();
 
   renderTranscript();
   if (note) {
     document.getElementById('notesContent').innerHTML = renderMarkdown(note.content);
-    document.getElementById('noteMethod').value = note.method || 'cornell';
+    document.getElementById('noteMethod').value = note.method || (currentSessionMode === 'meeting' ? 'meeting' : 'cornell');
   } else {
     document.getElementById('notesContent').innerHTML = `<div class="empty-msg"><div class="em-icon">📝</div>Notes will appear after the session ends, or click Generate.</div>`;
   }
   renderSidebar();
 }
 
+function updateNoteMethodOptions() {
+  const sel = document.getElementById('noteMethod');
+  if (currentSessionMode === 'meeting') {
+    sel.innerHTML = '<option value="meeting">Meeting Minutes</option>';
+  } else {
+    sel.innerHTML = '<option value="cornell">Cornell Method</option><option value="outline">Outline Method</option>';
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  Mode chooser
+// ══════════════════════════════════════════════════════
+function showModeChooser(folderId = null) {
+  modeChooserFolderId = folderId;
+  document.getElementById('modeChooserModal').classList.remove('hidden');
+}
+function closeModeChooser() {
+  document.getElementById('modeChooserModal').classList.add('hidden');
+  modeChooserFolderId = null;
+}
+function confirmModeChooser(mode) {
+  closeModeChooser();
+  newRecording(modeChooserFolderId, mode);
+}
+
 // ══════════════════════════════════════════════════════
 //  New recording
 // ══════════════════════════════════════════════════════
-async function newRecording(folderId = null) {
+async function newRecording(folderId = null, mode = 'lecture') {
   const res = await fetch('/api/sessions', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ title:`Session ${new Date().toLocaleTimeString()}`, folder_id: folderId })
+    body: JSON.stringify({ title:`Session ${new Date().toLocaleTimeString()}`, folder_id: folderId, mode })
   });
   const session = await res.json();
   sessions.unshift(session);
   renderSidebar();
   openSession(session.id);
-  // Auto-start
   startRecording();
 }
 
@@ -666,6 +851,7 @@ async function startRecording() {
 
     ws.send(JSON.stringify({
       type:'start_session', session_id:sessionId,
+      session_mode: currentSessionMode,
       summary_mode: document.getElementById('summaryMode').value,
       summary_interval: 5,
     }));
@@ -747,6 +933,7 @@ function handleWSMessage(msg) {
   switch(msg.type) {
     case 'partial_transcript':
       currentPartialText = msg.data.text;
+      currentPartialSpeaker = msg.data.speaker || 'speaker_0';
       renderTranscript(); break;
     case 'final_transcript':
       finals.push({text:msg.data.text,start:msg.data.start,end:msg.data.end,speaker:msg.data.speaker});
@@ -764,6 +951,9 @@ function handleWSMessage(msg) {
     case 'notes_generated':
       document.getElementById('notesContent').innerHTML=renderMarkdown(msg.data.content);
       if(!notesVisible)toggleNotes(); break;
+    case 'speaker_renamed':
+      speakerNameMap[msg.data.speaker_key] = msg.data.display_name;
+      renderTranscript(); break;
     case 'error':
       console.error('[Server]',msg.data.message); break;
   }
@@ -774,27 +964,122 @@ function handleWSMessage(msg) {
 // ══════════════════════════════════════════════════════
 function fmt(s){if(s==null)return'--:--';const m=Math.floor(s/60),sec=Math.floor(s%60);return`${m}:${String(sec).padStart(2,'0')}`;}
 
+function getSpeakerDisplay(speakerKey) {
+  return speakerNameMap[speakerKey] || speakerKey.replace('speaker_', 'Speaker ').replace('Speaker 0','Speaker 1').replace(/Speaker (\d+)/, (m,n)=>'Speaker '+(parseInt(n)+1));
+}
+
+function getSpeakerColorClass(speakerKey) {
+  const num = parseInt(speakerKey.replace('speaker_', ''), 10) || 0;
+  return SPEAKER_COLORS[num % SPEAKER_COLORS.length];
+}
+
 function renderTranscript() {
   const c=document.getElementById('transcriptScroll');
   const atBottom=c.scrollTop+c.clientHeight>=c.scrollHeight-50;
   let html='';
+  const isMeeting = currentSessionMode === 'meeting';
 
   if(currentView==='split') {
-    for(const f of finals) html+=`<div class="t-entry final"><div class="t-meta"><span class="t-time">${fmt(f.start)}</span><span class="t-label">Final</span></div><div class="t-text">${esc(f.text)}</div></div>`;
-    if(currentPartialText) html+=`<div class="t-entry partial"><div class="t-meta"><span class="t-time">…</span><span class="t-label">Partial</span></div><div class="t-text">${esc(currentPartialText)}</div></div>`;
+    for(const f of finals) {
+      const spkHtml = isMeeting ? `<span class="t-speaker ${getSpeakerColorClass(f.speaker)}" onclick="showSpeakerModal()">${esc(getSpeakerDisplay(f.speaker))}</span>` : '';
+      html+=`<div class="t-entry final"><div class="t-meta"><span class="t-time">${fmt(f.start)}</span>${spkHtml}<span class="t-label">Final</span></div><div class="t-text">${esc(f.text)}</div></div>`;
+    }
+    if(currentPartialText) {
+      const spkHtml = isMeeting ? `<span class="t-speaker ${getSpeakerColorClass(currentPartialSpeaker)}" onclick="showSpeakerModal()">${esc(getSpeakerDisplay(currentPartialSpeaker))}</span>` : '';
+      html+=`<div class="t-entry partial"><div class="t-meta"><span class="t-time">…</span>${spkHtml}<span class="t-label">Partial</span></div><div class="t-text">${esc(currentPartialText)}</div></div>`;
+    }
   } else if(currentView==='combined') {
-    for(const f of finals) html+=`<span style="font-size:13px;line-height:1.8"><span style="font-family:var(--mono);font-size:10px;color:var(--text-muted)">${fmt(f.start)}</span> ${esc(f.text)} </span>`;
+    let lastSpeaker = null;
+    for(const f of finals) {
+      let prefix = `<span style="font-family:var(--mono);font-size:10px;color:var(--text-muted)">${fmt(f.start)}</span>`;
+      if (isMeeting && f.speaker !== lastSpeaker) {
+        prefix = `<br><span class="t-speaker ${getSpeakerColorClass(f.speaker)}" style="display:inline-block;margin:4px 0 2px" onclick="showSpeakerModal()">${esc(getSpeakerDisplay(f.speaker))}</span><br>${prefix}`;
+        lastSpeaker = f.speaker;
+      }
+      html+=`<span style="font-size:13px;line-height:1.8">${prefix} ${esc(f.text)} </span>`;
+    }
     if(currentPartialText) html+=`<span style="color:var(--text-muted);font-style:italic">${esc(currentPartialText)}</span>`;
   } else {
-    for(const f of finals) html+=`<div class="t-entry final"><div class="t-meta"><span class="t-time">${fmt(f.start)}</span></div><div class="t-text">${esc(f.text)}</div></div>`;
+    for(const f of finals) {
+      const spkHtml = isMeeting ? `<span class="t-speaker ${getSpeakerColorClass(f.speaker)}" onclick="showSpeakerModal()">${esc(getSpeakerDisplay(f.speaker))}</span>` : '';
+      html+=`<div class="t-entry final"><div class="t-meta"><span class="t-time">${fmt(f.start)}</span>${spkHtml}</div><div class="t-text">${esc(f.text)}</div></div>`;
+    }
   }
 
-  if(!html) html='<div class="empty-msg"><div class="em-icon">🎙️</div>Transcript will appear here when you start recording.</div>';
+  if(!html) {
+    const modeHint = isMeeting
+      ? 'Transcript will appear here with speaker labels when you start recording.'
+      : 'Transcript will appear here when you start recording.';
+    html=`<div class="empty-msg"><div class="em-icon">🎙️</div>${modeHint}</div>`;
+  }
   c.innerHTML=html;
   if(atBottom)c.scrollTop=c.scrollHeight;
 }
 
 function setView(v,btn){currentView=v;document.querySelectorAll('.view-toggle button').forEach(b=>b.classList.remove('active'));btn.classList.add('active');renderTranscript();}
+
+// ══════════════════════════════════════════════════════
+//  Speaker modal
+// ══════════════════════════════════════════════════════
+async function showSpeakerModal() {
+  if (!sessionId) return;
+  // Refresh speaker data
+  try {
+    const spks = await fetch(`/api/sessions/${sessionId}/speakers`).then(r=>r.json());
+    const list = document.getElementById('speakerList');
+    if (spks.length === 0) {
+      // Check if we have speakers from transcript
+      const uniqueSpeakers = [...new Set(finals.map(f=>f.speaker))];
+      if (uniqueSpeakers.length === 0) {
+        list.innerHTML = '<div class="empty-msg" style="padding:20px"><div class="em-icon">🎤</div>No speakers detected yet. Start recording to detect speakers.</div>';
+      } else {
+        list.innerHTML = uniqueSpeakers.map(sk => {
+          const num = parseInt(sk.replace('speaker_', ''), 10) || 0;
+          const colorClass = SPEAKER_COLORS[num % SPEAKER_COLORS.length];
+          const displayName = speakerNameMap[sk] || `Speaker ${num + 1}`;
+          return `<div class="speaker-row">
+            <span class="spk-badge ${colorClass}">${esc(sk)}</span>
+            <input type="text" data-speaker="${sk}" value="${esc(displayName)}" placeholder="Enter name...">
+          </div>`;
+        }).join('');
+      }
+    } else {
+      list.innerHTML = spks.map(s => {
+        const num = parseInt(s.speaker_key.replace('speaker_', ''), 10) || 0;
+        const colorClass = SPEAKER_COLORS[num % SPEAKER_COLORS.length];
+        return `<div class="speaker-row">
+          <span class="spk-badge ${colorClass}">${esc(s.speaker_key)}</span>
+          <input type="text" data-speaker="${s.speaker_key}" value="${esc(s.display_name)}" placeholder="Enter name...">
+        </div>`;
+      }).join('');
+    }
+  } catch(e) {
+    console.error('Failed to load speakers:', e);
+  }
+  document.getElementById('speakerModal').classList.remove('hidden');
+}
+
+function closeSpeakerModal() {
+  document.getElementById('speakerModal').classList.add('hidden');
+}
+
+async function saveSpeakerNames() {
+  const inputs = document.querySelectorAll('#speakerList input[data-speaker]');
+  for (const inp of inputs) {
+    const key = inp.dataset.speaker;
+    const name = inp.value.trim();
+    if (name && name !== speakerNameMap[key]) {
+      await fetch(`/api/sessions/${sessionId}/speakers/${key}`, {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ display_name: name })
+      });
+      speakerNameMap[key] = name;
+    }
+  }
+  renderTranscript();
+  closeSpeakerModal();
+}
 
 // ══════════════════════════════════════════════════════
 //  Q&A
@@ -937,7 +1222,7 @@ function showFolderCtx(e,fid){
   const m=document.getElementById('ctxMenu');
   m.innerHTML=`
     <button onclick="showNewFolderModal('${fid}')">Edit folder</button>
-    <button onclick="newRecording('${fid}')">New recording here</button>
+    <button onclick="showModeChooser('${fid}')">New recording here</button>
     <button class="danger" onclick="deleteFolderConfirm('${fid}')">Delete folder</button>`;
   m.style.left=e.clientX+'px'; m.style.top=e.clientY+'px';
   m.classList.add('show');
@@ -955,7 +1240,7 @@ async function autoTitleSession(sid){
 async function deleteSessionConfirm(sid){
   if(!confirm('Delete this session and all its data?')) return;
   await fetch(`/api/sessions/${sid}`,{method:'DELETE'});
-  if(sid===activeSessionId){activeSessionId=null;document.getElementById('homeView').style.display='';document.getElementById('transcriptPanel').style.display='none';}
+  if(sid===activeSessionId){activeSessionId=null;document.getElementById('homeView').style.display='';document.getElementById('transcriptPanel').style.display='none';document.getElementById('modeBadge').style.display='none';}
   loadSidebar();
 }
 async function deleteFolderConfirm(fid){
@@ -976,6 +1261,8 @@ function renderMarkdown(md) {
     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/^- \[ \] (.+)$/gm, '☐ $1')
+    .replace(/^- \[x\] (.+)$/gm, '☑ $1')
     .replace(/^- (.+)$/gm, '• $1')
     .replace(/^  - (.+)$/gm, '&nbsp;&nbsp;◦ $1')
     .replace(/^    - (.+)$/gm, '&nbsp;&nbsp;&nbsp;&nbsp;▪ $1')
