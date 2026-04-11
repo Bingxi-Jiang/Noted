@@ -404,6 +404,36 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .ctx-menu button:hover { background:var(--surface-3); color:var(--text); }
 .ctx-menu button.danger { color:var(--red); }
 .ctx-menu button.danger:hover { background:#f8717115; }
+
+/* ── Screen share ── */
+.btn.screen-active { border-color:var(--cyan); color:var(--cyan); background:rgba(34,211,238,.08); }
+.btn.screen-active:hover { background:rgba(34,211,238,.15); }
+
+.screen-preview-strip {
+  display:none; padding:6px 16px; background:var(--surface);
+  border-bottom:1px solid var(--border); align-items:center; gap:10px;
+}
+.screen-preview-strip.show { display:flex; }
+.screen-preview-strip canvas {
+  width:120px; height:68px; border-radius:4px; border:1px solid var(--border);
+  background:#000; object-fit:contain;
+}
+.screen-preview-strip .sp-info {
+  flex:1; font-size:11px; color:var(--text-dim);
+}
+.screen-preview-strip .sp-status {
+  font-family:var(--mono); font-size:10px; padding:2px 8px;
+  border-radius:100px; background:var(--cyan); color:#000; font-weight:600;
+}
+.screen-preview-strip .sp-count {
+  font-family:var(--mono); font-size:10px; color:var(--text-muted);
+}
+
+/* Screen capture notification in transcript */
+.t-entry.screen-cap {
+  background:rgba(34,211,238,.06); border-left-color:var(--cyan);
+}
+.t-entry.screen-cap .t-label { background:rgba(34,211,238,.15); color:var(--cyan); }
 </style>
 </head>
 <body>
@@ -440,6 +470,8 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       </div>
       <!-- Meeting mode: speakers button -->
       <button class="btn meeting-btn" id="btnSpeakers" style="display:none" onclick="showSpeakerModal()">👥 Speakers</button>
+      <!-- Screen share button (both modes) -->
+      <button class="btn" id="btnScreen" style="display:none" onclick="toggleScreenShare()">🖥️ Screen</button>
       <button class="btn primary" id="btnRec" style="display:none" onclick="startRecording()">Record</button>
       <button class="btn stop" id="btnStop" style="display:none" onclick="stopRecording()">Stop</button>
       <button class="btn" id="btnNotes" style="display:none" onclick="toggleNotes()">Notes</button>
@@ -482,6 +514,16 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
             <button onclick="setView('combined',this)">Flow</button>
             <button onclick="setView('final',this)">Final</button>
           </div>
+        </div>
+        <!-- Screen share preview strip -->
+        <div class="screen-preview-strip" id="screenPreviewStrip">
+          <canvas id="screenPreviewCanvas" width="240" height="135"></canvas>
+          <div class="sp-info">
+            <div style="font-weight:600;margin-bottom:2px">🖥️ Screen Sharing Active</div>
+            <div class="sp-count" id="screenCaptureCount">0 captures analyzed</div>
+          </div>
+          <span class="sp-status">LIVE</span>
+          <button class="btn stop" onclick="stopScreenShare()" style="font-size:10px;padding:3px 10px">Stop</button>
         </div>
         <div class="transcript-scroll" id="transcriptScroll"></div>
         <div class="qa-result" id="qaResult">
@@ -604,6 +646,14 @@ let currentSessionMode = 'lecture'; // 'lecture' or 'meeting'
 let speakerNameMap = {}; // { speaker_0: 'Paul', speaker_1: 'Lisa', ... }
 let modeChooserFolderId = null;
 
+// Screen sharing state
+let screenStream = null, screenVideo = null, screenCaptureInterval = null;
+let isScreenSharing = false, screenCaptureCount = 0;
+let previousFrameData = null; // for pixel-diff comparison
+const screenCaptureEntries = []; // { capture_time, description, extracted_text }
+const CAPTURE_INTERVAL_MS = 10000; // check every 10 seconds
+const DIFF_THRESHOLD = 0.04; // 4% pixel change triggers a capture send
+
 const SPEAKER_COLORS = ['spk-0','spk-1','spk-2','spk-3','spk-4','spk-5','spk-6','spk-7'];
 
 // ══════════════════════════════════════════════════════
@@ -689,17 +739,24 @@ async function openSession(sid) {
   currentPartialText = '';
   currentPartialSpeaker = 'speaker_0';
   speakerNameMap = {};
+  screenCaptureEntries.length = 0;
+  screenCaptureCount = 0;
 
-  const [session, chunks, sums, note, spkMap] = await Promise.all([
+  const [session, chunks, sums, note, spkMap, scrCaps] = await Promise.all([
     fetch(`/api/sessions/${sid}`).then(r=>r.json()),
     fetch(`/api/sessions/${sid}/chunks`).then(r=>r.json()),
     fetch(`/api/sessions/${sid}/summaries`).then(r=>r.json()),
     fetch(`/api/sessions/${sid}/notes`).then(r=>r.json()),
     fetch(`/api/sessions/${sid}/speaker-map`).then(r=>r.json()),
+    fetch(`/api/sessions/${sid}/screen-captures`).then(r=>r.json()),
   ]);
 
   currentSessionMode = session.mode || 'lecture';
   speakerNameMap = spkMap || {};
+  if (scrCaps && scrCaps.length > 0) {
+    scrCaps.forEach(sc => screenCaptureEntries.push({ capture_time: sc.capture_time, description: sc.description, extracted_text: sc.extracted_text }));
+    screenCaptureCount = scrCaps.length;
+  }
 
   chunks.forEach(c => finals.push({ text:c.text, start:c.start_time, end:c.end_time, speaker:c.speaker }));
   sums.forEach(s => summaries.push(s));
@@ -723,6 +780,12 @@ async function openSession(sid) {
   document.getElementById('btnStop').style.display = 'none';
   document.getElementById('recBadge').style.display = '';
   document.getElementById('recTime').style.display = '';
+  document.getElementById('btnScreen').style.display = '';
+  // Reset screen share UI
+  document.getElementById('screenPreviewStrip').classList.remove('show');
+  document.getElementById('btnScreen').className = 'btn';
+  document.getElementById('btnScreen').textContent = '🖥️ Screen';
+  document.getElementById('screenCaptureCount').textContent = screenCaptureCount > 0 ? `${screenCaptureCount} captures analyzed` : '0 captures analyzed';
 
   if (currentSessionMode === 'lecture') {
     document.getElementById('srcToggle').style.display = '';
@@ -916,6 +979,7 @@ function stopRecording() {
   ws=null;
   if(audioContext){audioContext.close();audioContext=null;}
   cleanupStreams();
+  if (isScreenSharing) stopScreenShare();
   document.getElementById('btnRec').style.display='';
   document.getElementById('btnStop').style.display='none';
   document.getElementById('recBadge').className='rec-badge idle';
@@ -954,6 +1018,20 @@ function handleWSMessage(msg) {
     case 'speaker_renamed':
       speakerNameMap[msg.data.speaker_key] = msg.data.display_name;
       renderTranscript(); break;
+    case 'screen_capture_analyzed':
+      // Already handled via REST response in sendScreenCapture, but
+      // this handles multi-client broadcast for other connected viewers
+      if (!screenCaptureEntries.find(e => e.capture_time === msg.data.capture_time)) {
+        screenCaptureEntries.push({
+          capture_time: msg.data.capture_time,
+          description: msg.data.description || '',
+          extracted_text: msg.data.extracted_text || '',
+        });
+        screenCaptureCount = screenCaptureEntries.length;
+        document.getElementById('screenCaptureCount').textContent = `${screenCaptureCount} captures analyzed`;
+        renderTranscript();
+      }
+      break;
     case 'error':
       console.error('[Server]',msg.data.message); break;
   }
@@ -979,10 +1057,27 @@ function renderTranscript() {
   let html='';
   const isMeeting = currentSessionMode === 'meeting';
 
+  // Build a merged timeline of finals + screen captures for split/final views
+  function screenCapHtml(sc) {
+    return `<div class="t-entry screen-cap final"><div class="t-meta"><span class="t-time">${fmt(sc.capture_time)}</span><span class="t-label">📺 Screen</span></div><div class="t-text" style="color:var(--cyan)">${esc(sc.description)}${sc.extracted_text ? '<br><span style="color:var(--text-dim);font-size:12px">'+esc(sc.extracted_text).substring(0,200)+(sc.extracted_text.length>200?'…':'')+'</span>':''}</div></div>`;
+  }
+
   if(currentView==='split') {
+    // Merge finals and screen captures by time
+    let scIdx = 0;
     for(const f of finals) {
+      // Insert any screen captures that happened before this transcript
+      while (scIdx < screenCaptureEntries.length && screenCaptureEntries[scIdx].capture_time <= f.start) {
+        html += screenCapHtml(screenCaptureEntries[scIdx]);
+        scIdx++;
+      }
       const spkHtml = isMeeting ? `<span class="t-speaker ${getSpeakerColorClass(f.speaker)}" onclick="showSpeakerModal()">${esc(getSpeakerDisplay(f.speaker))}</span>` : '';
       html+=`<div class="t-entry final"><div class="t-meta"><span class="t-time">${fmt(f.start)}</span>${spkHtml}<span class="t-label">Final</span></div><div class="t-text">${esc(f.text)}</div></div>`;
+    }
+    // Remaining screen captures
+    while (scIdx < screenCaptureEntries.length) {
+      html += screenCapHtml(screenCaptureEntries[scIdx]);
+      scIdx++;
     }
     if(currentPartialText) {
       const spkHtml = isMeeting ? `<span class="t-speaker ${getSpeakerColorClass(currentPartialSpeaker)}" onclick="showSpeakerModal()">${esc(getSpeakerDisplay(currentPartialSpeaker))}</span>` : '';
@@ -1000,9 +1095,18 @@ function renderTranscript() {
     }
     if(currentPartialText) html+=`<span style="color:var(--text-muted);font-style:italic">${esc(currentPartialText)}</span>`;
   } else {
+    let scIdx = 0;
     for(const f of finals) {
+      while (scIdx < screenCaptureEntries.length && screenCaptureEntries[scIdx].capture_time <= f.start) {
+        html += screenCapHtml(screenCaptureEntries[scIdx]);
+        scIdx++;
+      }
       const spkHtml = isMeeting ? `<span class="t-speaker ${getSpeakerColorClass(f.speaker)}" onclick="showSpeakerModal()">${esc(getSpeakerDisplay(f.speaker))}</span>` : '';
       html+=`<div class="t-entry final"><div class="t-meta"><span class="t-time">${fmt(f.start)}</span>${spkHtml}</div><div class="t-text">${esc(f.text)}</div></div>`;
+    }
+    while (scIdx < screenCaptureEntries.length) {
+      html += screenCapHtml(screenCaptureEntries[scIdx]);
+      scIdx++;
     }
   }
 
@@ -1247,6 +1351,183 @@ async function deleteFolderConfirm(fid){
   if(!confirm('Delete this folder? Sessions will be moved to Unfiled.')) return;
   await fetch(`/api/folders/${fid}`,{method:'DELETE'});
   loadSidebar();
+}
+
+// ══════════════════════════════════════════════════════
+//  Screen Sharing + Vision Capture
+// ══════════════════════════════════════════════════════
+async function toggleScreenShare() {
+  if (isScreenSharing) {
+    stopScreenShare();
+  } else {
+    await startScreenShare();
+  }
+}
+
+async function startScreenShare() {
+  try {
+    // getDisplayMedia lets user pick: entire screen, window, or tab
+    screenStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { cursor: 'always' },
+      audio: false, // we only need the visual feed
+    });
+
+    // Create hidden video element to draw frames from
+    screenVideo = document.createElement('video');
+    screenVideo.srcObject = screenStream;
+    screenVideo.muted = true;
+    screenVideo.play();
+
+    // Track ended event (user clicks browser's "Stop sharing")
+    screenStream.getVideoTracks()[0].addEventListener('ended', () => {
+      stopScreenShare();
+    });
+
+    isScreenSharing = true;
+    previousFrameData = null;
+
+    // Update UI
+    document.getElementById('btnScreen').className = 'btn screen-active';
+    document.getElementById('btnScreen').textContent = '🖥️ Sharing…';
+    document.getElementById('screenPreviewStrip').classList.add('show');
+
+    // Wait for video to be ready, then start capture loop
+    screenVideo.addEventListener('loadedmetadata', () => {
+      startCaptureLoop();
+    });
+    // Fallback if already loaded
+    if (screenVideo.readyState >= 2) startCaptureLoop();
+
+  } catch (err) {
+    console.warn('[ScreenShare] Failed:', err.message);
+    // User cancelled — that's fine
+  }
+}
+
+function stopScreenShare() {
+  if (screenCaptureInterval) { clearInterval(screenCaptureInterval); screenCaptureInterval = null; }
+  if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
+  if (screenVideo) { screenVideo.pause(); screenVideo.srcObject = null; screenVideo = null; }
+  isScreenSharing = false;
+  previousFrameData = null;
+  document.getElementById('btnScreen').className = 'btn';
+  document.getElementById('btnScreen').textContent = '🖥️ Screen';
+  document.getElementById('screenPreviewStrip').classList.remove('show');
+}
+
+function startCaptureLoop() {
+  if (screenCaptureInterval) return; // already running
+
+  const canvas = document.getElementById('screenPreviewCanvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  // Capture comparison canvas (lower res for diffing)
+  const diffCanvas = document.createElement('canvas');
+  diffCanvas.width = 160;
+  diffCanvas.height = 90;
+  const diffCtx = diffCanvas.getContext('2d', { willReadFrequently: true });
+
+  // Send canvas (medium res for Gemini — 1280x720 max to keep base64 reasonable)
+  const sendCanvas = document.createElement('canvas');
+  sendCanvas.width = 1280;
+  sendCanvas.height = 720;
+  const sendCtx = sendCanvas.getContext('2d');
+
+  screenCaptureInterval = setInterval(async () => {
+    if (!screenVideo || screenVideo.paused || screenVideo.ended || !isScreenSharing) return;
+
+    // Draw preview
+    canvas.width = 240; canvas.height = 135;
+    ctx.drawImage(screenVideo, 0, 0, 240, 135);
+
+    // Draw diff frame
+    diffCtx.drawImage(screenVideo, 0, 0, 160, 90);
+    const currentFrame = diffCtx.getImageData(0, 0, 160, 90);
+
+    // Compare with previous frame
+    const hasSignificantChange = computeFrameDiff(previousFrameData, currentFrame);
+    previousFrameData = currentFrame;
+
+    if (!hasSignificantChange) return; // skip if screen hasn't changed much
+
+    // Draw send frame
+    const vw = screenVideo.videoWidth || 1280;
+    const vh = screenVideo.videoHeight || 720;
+    const aspect = vw / vh;
+    let sw = 1280, sh = 720;
+    if (aspect > 1280/720) { sh = Math.round(1280 / aspect); } else { sw = Math.round(720 * aspect); }
+    sendCanvas.width = sw; sendCanvas.height = sh;
+    sendCtx.drawImage(screenVideo, 0, 0, sw, sh);
+
+    // Convert to JPEG base64
+    const dataUrl = sendCanvas.toDataURL('image/jpeg', 0.75);
+    const base64 = dataUrl.split(',')[1];
+
+    // Get elapsed time for capture_time
+    const captureTime = startTimestamp ? (Date.now() - startTimestamp) / 1000 : 0;
+
+    // Get recent transcript for context
+    const recentText = finals.slice(-5).map(f => f.text).join(' ');
+
+    // Send to server for analysis (fire and forget — don't block the loop)
+    sendScreenCapture(base64, captureTime, recentText);
+
+  }, CAPTURE_INTERVAL_MS);
+}
+
+function computeFrameDiff(prev, current) {
+  if (!prev) return true; // first frame always counts
+
+  const d1 = prev.data;
+  const d2 = current.data;
+  const len = d1.length;
+  let diffPixels = 0;
+  const totalPixels = len / 4;
+
+  // Sample every 4th pixel for speed
+  for (let i = 0; i < len; i += 16) {
+    const dr = Math.abs(d1[i] - d2[i]);
+    const dg = Math.abs(d1[i+1] - d2[i+1]);
+    const db = Math.abs(d1[i+2] - d2[i+2]);
+    if (dr + dg + db > 60) diffPixels++; // threshold per pixel
+  }
+
+  const ratio = diffPixels / (totalPixels / 4);
+  return ratio >= DIFF_THRESHOLD;
+}
+
+let screenCapturePending = false;
+async function sendScreenCapture(base64, captureTime, recentTranscript) {
+  if (!sessionId || screenCapturePending) return;
+  screenCapturePending = true;
+  try {
+    const res = await fetch(`/api/sessions/${sessionId}/screen-capture`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image: base64,
+        capture_time: captureTime,
+        mime_type: 'image/jpeg',
+        recent_transcript: recentTranscript,
+      }),
+    });
+    const data = await res.json();
+    if (!data.error) {
+      screenCaptureCount++;
+      document.getElementById('screenCaptureCount').textContent = `${screenCaptureCount} captures analyzed`;
+      screenCaptureEntries.push({
+        capture_time: captureTime,
+        description: data.description || '',
+        extracted_text: data.extracted_text || '',
+      });
+      // Add visual entry to transcript
+      renderTranscript();
+    }
+  } catch (e) {
+    console.error('[ScreenCapture] send failed:', e.message);
+  } finally {
+    screenCapturePending = false;
+  }
 }
 
 // ══════════════════════════════════════════════════════

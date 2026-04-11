@@ -63,6 +63,77 @@ async function callGemini(
   return text;
 }
 
+// ── Vision: call Gemini with image ──
+async function callGeminiWithImage(apiKey, systemPrompt, textMessage, imageBase64, mimeType = 'image/jpeg', { maxOutputTokens = 1024, thinkingLevel = 'low' } = {}) {
+  const body = {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{
+      role: 'user',
+      parts: [
+        { inline_data: { mime_type: mimeType, data: imageBase64 } },
+        { text: textMessage },
+      ],
+    }],
+    generationConfig: {
+      maxOutputTokens,
+      thinkingConfig: { thinkingLevel },
+    },
+  };
+
+  const res = await fetch(GEMINI_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Gemini Vision API error ${res.status}: ${err}`);
+  }
+
+  const data = await res.json();
+  const text = extractTextFromGeminiResponse(data);
+  if (!text) throw new Error('Gemini Vision returned an empty response.');
+  return text;
+}
+
+// ── Analyze screen capture ──
+export async function analyzeScreenCapture(apiKey, imageBase64, recentTranscript = '', mimeType = 'image/jpeg') {
+  const system = `You are analyzing a screenshot captured during a lecture or meeting. Your job is to extract ALL useful information visible on screen.
+
+Focus on:
+1. Any text visible (slides, documents, code, chat messages, whiteboard notes)
+2. Diagrams, charts, or visual aids — describe their content and meaning
+3. Key concepts, formulas, or data shown
+4. UI elements that indicate context (app name, slide number, page title)
+
+Output in this JSON format:
+{
+  "description": "Brief 1-2 sentence description of what's on screen",
+  "extracted_text": "All readable text from the screenshot, preserving structure",
+  "key_concepts": ["concept1", "concept2"],
+  "visual_elements": "Description of any diagrams, charts, or images",
+  "context_clue": "Any contextual info (slide number, app name, etc.)"
+}`;
+
+  const prompt = recentTranscript
+    ? `Analyze this screenshot. Recent audio transcript for context:\n"${recentTranscript.substring(0, 500)}"\n\nExtract all visible information.`
+    : `Analyze this screenshot and extract all visible information.`;
+
+  const raw = await callGeminiWithImage(apiKey, system, prompt, imageBase64, mimeType, {
+    maxOutputTokens: 1024,
+    thinkingLevel: 'low',
+  });
+
+  return safeJsonParse(raw, {
+    description: raw.substring(0, 200),
+    extracted_text: '',
+    key_concepts: [],
+    visual_elements: '',
+    context_clue: '',
+  });
+}
+
 function safeJsonParse(raw, fallback) {
   try {
     return JSON.parse(raw.trim());
@@ -271,7 +342,7 @@ export function getNoteMethods(mode = null) {
   return Object.entries(NOTE_METHODS).map(([id, m]) => ({ id, name: m.name, mode: m.mode }));
 }
 
-export async function generateNotes(apiKey, chunks, summaries = [], method = 'cornell', speakerNameMap = {}) {
+export async function generateNotes(apiKey, chunks, summaries = [], method = 'cornell', speakerNameMap = {}, screenCaptures = []) {
   const config = NOTE_METHODS[method] || NOTE_METHODS.cornell;
 
   const transcript = chunks.map(c => {
@@ -288,14 +359,28 @@ export async function generateNotes(apiKey, chunks, summaries = [], method = 'co
     ? '\n\nExisting summaries (for reference):\n' + summaries.map(s => s.summary_text).join('\n\n')
     : '';
 
+  // Screen capture context — interleave visual info with timestamps
+  let screenCtx = '';
+  if (screenCaptures.length > 0) {
+    screenCtx = '\n\n=== Screen Capture Context (visual information from shared screen) ===\n';
+    screenCtx += screenCaptures.map(sc => {
+      const mins = Math.floor(sc.capture_time / 60);
+      const secs = Math.floor(sc.capture_time % 60);
+      let entry = `[${mins}:${String(secs).padStart(2, '0')}] 📺 ${sc.description}`;
+      if (sc.extracted_text) entry += `\n    Visible text: ${sc.extracted_text}`;
+      return entry;
+    }).join('\n');
+    screenCtx += '\n=== End Screen Captures ===';
+  }
+
   let prompt;
   if (method === 'meeting') {
     const speakerInfo = Object.keys(speakerNameMap).length > 0
       ? '\n\nSpeaker name mapping:\n' + Object.entries(speakerNameMap).map(([k, v]) => `${k} = ${v}`).join('\n')
       : '';
-    prompt = `Generate comprehensive meeting notes from this transcript.${speakerInfo}${summaryCtx}\n\nFull transcript:\n${transcript}`;
+    prompt = `Generate comprehensive meeting notes from this transcript.${speakerInfo}${summaryCtx}${screenCtx}\n\nFull transcript:\n${transcript}`;
   } else {
-    prompt = `Generate comprehensive notes from this lecture transcript.${summaryCtx}\n\nFull transcript:\n${transcript}`;
+    prompt = `Generate comprehensive notes from this lecture transcript. Use BOTH the audio transcript AND the screen capture data to create thorough notes. The screen captures contain text, slides, diagrams, and visual content that supplement the spoken content.${summaryCtx}${screenCtx}\n\nFull transcript:\n${transcript}`;
   }
 
   return callGemini(apiKey, config.system, prompt, {

@@ -94,12 +94,25 @@ export async function initDB() {
     UNIQUE(session_id, speaker_key)
   )`);
 
+  // Screen captures for vision-augmented transcription
+  db.run(`CREATE TABLE IF NOT EXISTS screen_captures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    capture_time REAL NOT NULL,
+    description TEXT NOT NULL,
+    extracted_text TEXT DEFAULT '',
+    thumbnail TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+  )`);
+
   db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_folder ON sessions(folder_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chunks_session ON transcript_chunks(session_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chunks_time ON transcript_chunks(session_id, start_time)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_speaker_names_session ON speaker_names(session_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_screen_captures_session ON screen_captures(session_id, capture_time)`);
 
   save();
   console.log('[DB] Initialized at', DB_PATH);
@@ -165,6 +178,7 @@ export function deleteSession(id) {
   run('DELETE FROM summaries WHERE session_id = ?', [id]);
   run('DELETE FROM notes WHERE session_id = ?', [id]);
   run('DELETE FROM speaker_names WHERE session_id = ?', [id]);
+  run('DELETE FROM screen_captures WHERE session_id = ?', [id]);
   run('DELETE FROM sessions WHERE id = ?', [id]);
 }
 export function getSession(id) {
@@ -289,6 +303,19 @@ export function getFolderSummaries(folderId) {
     JOIN sessions s ON sm.session_id = s.id
     WHERE s.folder_id = ?
     ORDER BY s.created_at ASC, sm.start_time ASC`, [folderId]);
+}
+
+// ── Screen Captures ──
+export function insertScreenCapture(sessionId, captureTime, description, extractedText = '', thumbnail = '') {
+  run('INSERT INTO screen_captures (session_id, capture_time, description, extracted_text, thumbnail) VALUES (?, ?, ?, ?, ?)',
+    [sessionId, captureTime, description, extractedText, thumbnail]);
+}
+export function getScreenCaptures(sessionId) {
+  return all('SELECT * FROM screen_captures WHERE session_id = ? ORDER BY capture_time ASC', [sessionId]);
+}
+export function getScreenCapturesInRange(sessionId, fromTime, toTime) {
+  return all('SELECT * FROM screen_captures WHERE session_id = ? AND capture_time >= ? AND capture_time <= ? ORDER BY capture_time ASC',
+    [sessionId, fromTime, toTime]);
 }
 
 export function getDB() { return db; }

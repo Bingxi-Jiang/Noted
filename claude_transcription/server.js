@@ -15,11 +15,12 @@ import {
   insertSummary, getSummaries, getLatestSummary,
   upsertNote, getNote, updateNoteContent,
   getSpeakerNames, upsertSpeakerName, getSpeakerNameMap,
+  insertScreenCapture, getScreenCaptures,
 } from './db.js';
 import { createTranscriber } from './transcriber.js';
 import {
   generateRollingSummary, detectTopicChange, answerQuestion,
-  generateSessionTitle, generateNotes, getNoteMethods
+  generateSessionTitle, generateNotes, getNoteMethods, analyzeScreenCapture
 } from './summarizer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -33,7 +34,7 @@ if (!GEMINI_KEY || GEMINI_KEY === 'your_gemini_api_key_here')
   console.warn('\n⚠️  GEMINI_API_KEY not set — AI features won\'t work.\n');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -99,6 +100,54 @@ app.put('/api/sessions/:id/speakers/:key', (req, res) => {
 });
 app.get('/api/sessions/:id/speaker-map', (req, res) => {
   res.json(getSpeakerNameMap(req.params.id));
+});
+
+// ══════════════ Screen Capture API ══════════════
+app.get('/api/sessions/:id/screen-captures', (req, res) => {
+  res.json(getScreenCaptures(req.params.id));
+});
+
+app.post('/api/sessions/:id/screen-capture', async (req, res) => {
+  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  try {
+    const sid = req.params.id;
+    const { image, capture_time, mime_type, recent_transcript } = req.body;
+    if (!image) return res.status(400).json({ error: 'image (base64) required' });
+
+    const captureTime = capture_time || 0;
+    const mimeType = mime_type || 'image/jpeg';
+
+    // Analyze with Gemini Vision
+    const analysis = await analyzeScreenCapture(GEMINI_KEY, image, recent_transcript || '', mimeType);
+
+    // Store in DB (without the full image to save space — just the analysis)
+    // Keep a small thumbnail reference if needed later
+    insertScreenCapture(
+      sid,
+      captureTime,
+      analysis.description || '',
+      analysis.extracted_text || '',
+      '' // no thumbnail stored in DB to keep it lean
+    );
+
+    // Broadcast to clients
+    broadcastToSession(sid, {
+      type: 'screen_capture_analyzed',
+      data: {
+        capture_time: captureTime,
+        description: analysis.description,
+        extracted_text: analysis.extracted_text,
+        key_concepts: analysis.key_concepts,
+        visual_elements: analysis.visual_elements,
+        context_clue: analysis.context_clue,
+      }
+    });
+
+    res.json(analysis);
+  } catch (err) {
+    console.error('[ScreenCapture]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ══════════════ Transcript API ══════════════
@@ -200,7 +249,8 @@ app.post('/api/sessions/:id/notes/generate', async (req, res) => {
     if (chunks.length === 0) return res.status(400).json({ error: 'No transcript data' });
     const summaries = getSummaries(sid);
     const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sid) : {};
-    const content = await generateNotes(GEMINI_KEY, chunks, summaries, method, speakerNameMap);
+    const screenCaptures = getScreenCaptures(sid);
+    const content = await generateNotes(GEMINI_KEY, chunks, summaries, method, speakerNameMap, screenCaptures);
     const noteId = uuid();
     upsertNote(noteId, sid, method, content);
     res.json({ id: noteId, session_id: sid, method, content });
@@ -415,7 +465,8 @@ function stopSession(sessionId) {
       const summaries = getSummaries(sessionId);
       const defaultMethod = sessionMode === 'meeting' ? 'meeting' : 'cornell';
       const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sessionId) : {};
-      generateNotes(GEMINI_KEY, chunks, summaries, defaultMethod, speakerNameMap).then(content => {
+      const screenCaptures = getScreenCaptures(sessionId);
+      generateNotes(GEMINI_KEY, chunks, summaries, defaultMethod, speakerNameMap, screenCaptures).then(content => {
         const noteId = uuid();
         upsertNote(noteId, sessionId, defaultMethod, content);
         broadcastToSession(sessionId, { type: 'notes_generated', data: { id: noteId, method: defaultMethod, content } });
