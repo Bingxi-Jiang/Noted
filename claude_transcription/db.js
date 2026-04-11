@@ -1,4 +1,4 @@
-// db.js — SQLite database via sql.js (pure JS, no native deps)
+// db.js — SQLite database with folders, sessions, notes, cross-session RAG
 import initSqlJs from 'sql.js';
 import fs from 'fs';
 import path from 'path';
@@ -11,181 +11,249 @@ let db;
 
 function save() {
   const data = db.export();
-  const buffer = Buffer.from(data);
-  fs.writeFileSync(DB_PATH, buffer);
+  fs.writeFileSync(DB_PATH, Buffer.from(data));
 }
 
 let saveTimer = null;
 function scheduleSave() {
   if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    save();
-    saveTimer = null;
-  }, 2000);
+  saveTimer = setTimeout(() => { save(); saveTimer = null; }, 2000);
 }
 
 export async function initDB() {
   const SQL = await initSqlJs();
+  db = fs.existsSync(DB_PATH)
+    ? new SQL.Database(fs.readFileSync(DB_PATH))
+    : new SQL.Database();
 
-  if (fs.existsSync(DB_PATH)) {
-    const buffer = fs.readFileSync(DB_PATH);
-    db = new SQL.Database(buffer);
-  } else {
-    db = new SQL.Database();
-  }
+  db.run(`CREATE TABLE IF NOT EXISTS folders (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT DEFAULT '#6c5ce7',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      title TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now'))
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    folder_id TEXT,
+    title TEXT,
+    status TEXT DEFAULT 'active',
+    duration REAL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (folder_id) REFERENCES folders(id)
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS transcript_chunks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
-      text TEXT NOT NULL,
-      start_time REAL NOT NULL,
-      end_time REAL NOT NULL,
-      speaker TEXT DEFAULT 'speaker_0',
-      is_final INTEGER DEFAULT 1,
-      created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS transcript_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    start_time REAL NOT NULL,
+    end_time REAL NOT NULL,
+    speaker TEXT DEFAULT 'speaker_0',
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+  )`);
 
-  db.run(`
-    CREATE TABLE IF NOT EXISTS summaries (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
-      summary_text TEXT NOT NULL,
-      start_time REAL NOT NULL,
-      end_time REAL NOT NULL,
-      summary_type TEXT DEFAULT 'rolling',
-      topic_label TEXT,
-      created_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (session_id) REFERENCES sessions(id)
-    )
-  `);
+  db.run(`CREATE TABLE IF NOT EXISTS summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    summary_text TEXT NOT NULL,
+    start_time REAL NOT NULL,
+    end_time REAL NOT NULL,
+    summary_type TEXT DEFAULT 'rolling',
+    topic_label TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+  )`);
 
+  db.run(`CREATE TABLE IF NOT EXISTS notes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    method TEXT DEFAULT 'cornell',
+    content TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+  )`);
+
+  db.run(`CREATE INDEX IF NOT EXISTS idx_sessions_folder ON sessions(folder_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chunks_session ON transcript_chunks(session_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_chunks_time ON transcript_chunks(session_id, start_time)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id)`);
 
   save();
   console.log('[DB] Initialized at', DB_PATH);
   return db;
 }
 
+// ── Helpers ──
 function all(sql, params = []) {
   const stmt = db.prepare(sql);
   stmt.bind(params);
   const results = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
-  }
+  while (stmt.step()) results.push(stmt.getAsObject());
   stmt.free();
   return results;
 }
-
 function get(sql, params = []) {
   const rows = all(sql, params);
-  return rows.length > 0 ? rows[0] : null;
+  return rows[0] || null;
 }
-
 function run(sql, params = []) {
   db.run(sql, params);
   scheduleSave();
 }
 
-// ── Session CRUD ──
-
-export function createSession(id, title) {
-  run('INSERT INTO sessions (id, title) VALUES (?, ?)', [id, title]);
-  return { id, title };
+// ── Folders ──
+export function createFolder(id, name, color = '#6c5ce7') {
+  run('INSERT INTO folders (id, name, color) VALUES (?, ?, ?)', [id, name, color]);
+  return { id, name, color };
+}
+export function updateFolder(id, name, color) {
+  if (name !== undefined) run('UPDATE folders SET name = ?, updated_at = datetime("now") WHERE id = ?', [name, id]);
+  if (color !== undefined) run('UPDATE folders SET color = ?, updated_at = datetime("now") WHERE id = ?', [color, id]);
+}
+export function deleteFolder(id) {
+  // Unlink sessions, don't delete them
+  run('UPDATE sessions SET folder_id = NULL WHERE folder_id = ?', [id]);
+  run('DELETE FROM folders WHERE id = ?', [id]);
+}
+export function listFolders() {
+  const folders = all('SELECT * FROM folders ORDER BY created_at ASC');
+  // Attach session count
+  return folders.map(f => {
+    const count = get('SELECT COUNT(*) as c FROM sessions WHERE folder_id = ?', [f.id]);
+    return { ...f, session_count: count?.c || 0 };
+  });
+}
+export function getFolder(id) {
+  return get('SELECT * FROM folders WHERE id = ?', [id]);
 }
 
+// ── Sessions ──
+export function createSession(id, title, folderId = null) {
+  run('INSERT INTO sessions (id, title, folder_id) VALUES (?, ?, ?)', [id, title, folderId]);
+  return { id, title, folder_id: folderId, status: 'active' };
+}
+export function updateSession(id, updates) {
+  if (updates.title !== undefined) run('UPDATE sessions SET title = ?, updated_at = datetime("now") WHERE id = ?', [updates.title, id]);
+  if (updates.folder_id !== undefined) run('UPDATE sessions SET folder_id = ?, updated_at = datetime("now") WHERE id = ?', [updates.folder_id, id]);
+  if (updates.status !== undefined) run('UPDATE sessions SET status = ?, updated_at = datetime("now") WHERE id = ?', [updates.status, id]);
+  if (updates.duration !== undefined) run('UPDATE sessions SET duration = ?, updated_at = datetime("now") WHERE id = ?', [updates.duration, id]);
+}
+export function deleteSession(id) {
+  run('DELETE FROM transcript_chunks WHERE session_id = ?', [id]);
+  run('DELETE FROM summaries WHERE session_id = ?', [id]);
+  run('DELETE FROM notes WHERE session_id = ?', [id]);
+  run('DELETE FROM sessions WHERE id = ?', [id]);
+}
 export function getSession(id) {
   return get('SELECT * FROM sessions WHERE id = ?', [id]);
 }
-
-export function listSessions() {
+export function listSessions(folderId = null) {
+  if (folderId) {
+    return all('SELECT * FROM sessions WHERE folder_id = ? ORDER BY created_at DESC', [folderId]);
+  }
   return all('SELECT * FROM sessions ORDER BY created_at DESC');
+}
+export function listSessionsByFolder() {
+  const folders = listFolders();
+  const unfoldered = all("SELECT * FROM sessions WHERE folder_id IS NULL OR folder_id = '' ORDER BY created_at DESC");
+  return { folders, unfoldered };
 }
 
 // ── Transcript Chunks ──
-
 export function insertChunk(sessionId, text, startTime, endTime, speaker = 'speaker_0') {
-  run(
-    'INSERT INTO transcript_chunks (session_id, text, start_time, end_time, speaker) VALUES (?, ?, ?, ?, ?)',
-    [sessionId, text, startTime, endTime, speaker]
-  );
+  run('INSERT INTO transcript_chunks (session_id, text, start_time, end_time, speaker) VALUES (?, ?, ?, ?, ?)',
+    [sessionId, text, startTime, endTime, speaker]);
   run("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?", [sessionId]);
 }
-
 export function getChunks(sessionId, fromTime = 0, toTime = Infinity) {
-  if (toTime === Infinity) {
-    return all(
-      'SELECT * FROM transcript_chunks WHERE session_id = ? AND start_time >= ? ORDER BY start_time ASC',
-      [sessionId, fromTime]
-    );
-  }
-  return all(
-    'SELECT * FROM transcript_chunks WHERE session_id = ? AND start_time >= ? AND end_time <= ? ORDER BY start_time ASC',
-    [sessionId, fromTime, toTime]
-  );
+  if (toTime === Infinity)
+    return all('SELECT * FROM transcript_chunks WHERE session_id = ? AND start_time >= ? ORDER BY start_time ASC', [sessionId, fromTime]);
+  return all('SELECT * FROM transcript_chunks WHERE session_id = ? AND start_time >= ? AND end_time <= ? ORDER BY start_time ASC', [sessionId, fromTime, toTime]);
 }
-
 export function getRecentChunks(sessionId, lastNSeconds) {
   const latest = get('SELECT MAX(end_time) as max_time FROM transcript_chunks WHERE session_id = ?', [sessionId]);
-  if (!latest || !latest.max_time) return [];
-  const from = Math.max(0, latest.max_time - lastNSeconds);
-  return getChunks(sessionId, from);
+  if (!latest?.max_time) return [];
+  return getChunks(sessionId, Math.max(0, latest.max_time - lastNSeconds));
 }
-
 export function getAllChunks(sessionId) {
   return all('SELECT * FROM transcript_chunks WHERE session_id = ? ORDER BY start_time ASC', [sessionId]);
 }
-
 export function getFullTranscriptText(sessionId) {
-  const chunks = getAllChunks(sessionId);
-  return chunks.map(c => c.text).join(' ');
+  return getAllChunks(sessionId).map(c => c.text).join(' ');
 }
 
 // ── Summaries ──
-
 export function insertSummary(sessionId, summaryText, startTime, endTime, type = 'rolling', topicLabel = null) {
-  run(
-    'INSERT INTO summaries (session_id, summary_text, start_time, end_time, summary_type, topic_label) VALUES (?, ?, ?, ?, ?, ?)',
-    [sessionId, summaryText, startTime, endTime, type, topicLabel]
-  );
+  run('INSERT INTO summaries (session_id, summary_text, start_time, end_time, summary_type, topic_label) VALUES (?, ?, ?, ?, ?, ?)',
+    [sessionId, summaryText, startTime, endTime, type, topicLabel]);
 }
-
 export function getSummaries(sessionId) {
   return all('SELECT * FROM summaries WHERE session_id = ? ORDER BY start_time ASC', [sessionId]);
 }
-
 export function getLatestSummary(sessionId) {
   return get('SELECT * FROM summaries WHERE session_id = ? ORDER BY end_time DESC LIMIT 1', [sessionId]);
 }
 
-// ── RAG: keyword search ──
+// ── Notes ──
+export function upsertNote(id, sessionId, method, content) {
+  const existing = get('SELECT id FROM notes WHERE id = ?', [id]);
+  if (existing) {
+    run('UPDATE notes SET content = ?, method = ?, updated_at = datetime("now") WHERE id = ?', [content, method, id]);
+  } else {
+    run('INSERT INTO notes (id, session_id, method, content) VALUES (?, ?, ?, ?)', [id, sessionId, method, content]);
+  }
+}
+export function getNote(sessionId) {
+  return get('SELECT * FROM notes WHERE session_id = ? ORDER BY updated_at DESC LIMIT 1', [sessionId]);
+}
+export function updateNoteContent(id, content) {
+  run('UPDATE notes SET content = ?, updated_at = datetime("now") WHERE id = ?', [content, id]);
+}
+
+// ── Cross-session RAG: search across all sessions in a folder ──
+export function searchChunksInFolder(folderId, keywords) {
+  const words = keywords.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+  if (words.length === 0) return [];
+  const conditions = words.map(w => `LOWER(tc.text) LIKE '%${w.replace(/'/g, "''")}%'`).join(' OR ');
+  const sql = folderId
+    ? `SELECT tc.*, s.title as session_title FROM transcript_chunks tc
+       JOIN sessions s ON tc.session_id = s.id
+       WHERE s.folder_id = ? AND (${conditions})
+       ORDER BY tc.start_time ASC LIMIT 100`
+    : `SELECT tc.*, s.title as session_title FROM transcript_chunks tc
+       JOIN sessions s ON tc.session_id = s.id
+       WHERE (${conditions})
+       ORDER BY tc.start_time ASC LIMIT 100`;
+  return folderId ? all(sql, [folderId]) : all(sql);
+}
 
 export function searchChunks(sessionId, keywords) {
   const words = keywords.toLowerCase().split(/\s+/).filter(w => w.length > 2);
   if (words.length === 0) return getAllChunks(sessionId);
-
   const conditions = words.map(w => `LOWER(text) LIKE '%${w.replace(/'/g, "''")}%'`).join(' OR ');
-
-  return all(
-    `SELECT * FROM transcript_chunks WHERE session_id = ? AND (${conditions}) ORDER BY start_time ASC`,
-    [sessionId]
-  );
+  return all(`SELECT * FROM transcript_chunks WHERE session_id = ? AND (${conditions}) ORDER BY start_time ASC`, [sessionId]);
 }
 
-export function getDB() {
-  return db;
+// Get all chunks from all sessions in a folder (for cross-session Q&A)
+export function getFolderChunks(folderId, limit = 200) {
+  return all(`SELECT tc.*, s.title as session_title FROM transcript_chunks tc
+    JOIN sessions s ON tc.session_id = s.id
+    WHERE s.folder_id = ?
+    ORDER BY s.created_at ASC, tc.start_time ASC
+    LIMIT ?`, [folderId, limit]);
 }
+
+export function getFolderSummaries(folderId) {
+  return all(`SELECT sm.*, s.title as session_title FROM summaries sm
+    JOIN sessions s ON sm.session_id = s.id
+    WHERE s.folder_id = ?
+    ORDER BY s.created_at ASC, sm.start_time ASC`, [folderId]);
+}
+
+export function getDB() { return db; }

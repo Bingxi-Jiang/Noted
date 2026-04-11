@@ -1,37 +1,83 @@
-// summarizer.js — Rolling summaries & Q&A via Anthropic Claude API
+// summarizer.js — Summaries, Q&A, note generation, auto-titling via Gemini 3 Flash
 
-/**
- * Calls Anthropic Messages API.
- */
-async function callClaude(apiKey, systemPrompt, userMessage, maxTokens = 1024) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+const GEMINI_MODEL = 'gemini-3-flash-preview';
+const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+function extractTextFromGeminiResponse(data) {
+  const parts = data?.candidates?.[0]?.content?.parts ?? [];
+  return parts
+    .map((part) => part?.text || '')
+    .join('')
+    .trim();
+}
+
+async function callGemini(
+  apiKey,
+  systemPrompt,
+  userMessage,
+  {
+    maxOutputTokens = 1024,
+    thinkingLevel = 'low',
+    responseMimeType,
+  } = {},
+) {
+  const body = {
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    contents: [{
+      role: 'user',
+      parts: [{ text: userMessage }],
+    }],
+    generationConfig: {
+      maxOutputTokens,
+      thinkingConfig: {
+        thinkingLevel,
+      },
+    },
+  };
+
+  if (responseMimeType) {
+    body.generationConfig.responseMimeType = responseMimeType;
+  }
+
+  const res = await fetch(GEMINI_API_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
+      'x-goog-api-key': apiKey,
     },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: maxTokens,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: userMessage }],
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${err}`);
+    throw new Error(`Gemini API error ${res.status}: ${err}`);
   }
 
   const data = await res.json();
-  return data.content.map(b => b.text || '').join('\n');
+  const text = extractTextFromGeminiResponse(data);
+  if (!text) {
+    throw new Error('Gemini returned an empty response.');
+  }
+  return text;
 }
 
+function safeJsonParse(raw, fallback) {
+  try {
+    return JSON.parse(raw.trim());
+  } catch {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return fallback;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return fallback;
+    }
+  }
+}
 
-/**
- * Generate a rolling summary of transcript chunks.
- */
+// ── Rolling Summary ──
 export async function generateRollingSummary(apiKey, chunks, previousSummary = null) {
   const transcript = chunks.map(c => {
     const mins = Math.floor(c.start_time / 60);
@@ -39,73 +85,164 @@ export async function generateRollingSummary(apiKey, chunks, previousSummary = n
     return `[${mins}:${String(secs).padStart(2, '0')}] ${c.text}`;
   }).join('\n');
 
-  const system = `You are a lecture/meeting note-taker. Create concise, well-structured summaries.
-Include key concepts, definitions, important points, and any action items.
-Use bullet points for clarity. Keep summaries focused and information-dense.
-If a previous summary is provided, build upon it — don't repeat, just add new information.`;
+  const system = `You are a lecture and meeting note-taker. Create concise, well-structured summaries.
+Include key concepts, definitions, important points, decisions, and action items.
+Use bullet points for clarity. Keep summaries focused, information-dense, and non-redundant.
+If a previous summary is provided, extend it with only genuinely new information.`;
 
   const prompt = previousSummary
-    ? `Previous summary:\n${previousSummary}\n\n---\nNew transcript to incorporate:\n${transcript}\n\nUpdate the summary with the new content. Don't repeat old points unless they've been expanded on.`
-    : `Summarize the following transcript:\n${transcript}`;
+    ? `Previous summary:\n${previousSummary}\n\n---\nNew transcript:\n${transcript}\n\nUpdate the summary with new content only.`
+    : `Summarize this transcript:\n${transcript}`;
 
-  return callClaude(apiKey, system, prompt);
+  return callGemini(apiKey, system, prompt, {
+    maxOutputTokens: 1024,
+    thinkingLevel: 'low',
+  });
 }
 
-
-/**
- * Detect if a topic change occurred in recent chunks.
- * Returns { changed: boolean, newTopic: string, summary: string }
- */
+// ── Topic Detection ──
 export async function detectTopicChange(apiKey, recentChunks, previousTopicLabel = '') {
   const transcript = recentChunks.map(c => c.text).join(' ');
+  const system = `Analyze whether the topic of the transcript has materially changed.
+Respond with JSON only using this schema:
+{"changed": true/false, "topic": "short label", "summary": "brief explanation if changed"}`;
 
-  const system = `You analyze lecture/meeting transcripts to detect topic changes.
-Respond ONLY in valid JSON with this exact structure:
-{"changed": true/false, "topic": "topic label", "summary": "brief summary if changed"}
-No markdown, no backticks, just JSON.`;
+  const raw = await callGemini(
+    apiKey,
+    system,
+    `Previous topic: "${previousTopicLabel || 'none'}"\nTranscript: "${transcript}"`,
+    {
+      maxOutputTokens: 300,
+      thinkingLevel: 'low',
+      responseMimeType: 'application/json',
+    },
+  );
 
-  const prompt = `Previous topic: "${previousTopicLabel || 'none yet'}"
-
-Recent transcript:
-"${transcript}"
-
-Has the speaker moved to a significantly different topic? If so, what is the new topic and a brief summary of what they covered?`;
-
-  const raw = await callClaude(apiKey, system, prompt, 300);
-
-  try {
-    return JSON.parse(raw.trim());
-  } catch {
-    return { changed: false, topic: previousTopicLabel, summary: '' };
-  }
+  return safeJsonParse(raw, {
+    changed: false,
+    topic: previousTopicLabel,
+    summary: '',
+  });
 }
 
-
-/**
- * Answer a question based on transcript context (RAG).
- */
-export async function answerQuestion(apiKey, question, relevantChunks, summaries = []) {
+// ── Q&A (single session or cross-session) ──
+export async function answerQuestion(apiKey, question, relevantChunks, summaries = [], crossSession = false) {
   const context = relevantChunks.map(c => {
+    const mins = Math.floor(c.start_time / 60);
+    const secs = Math.floor(c.start_time % 60);
+    const prefix = c.session_title
+      ? `[${c.session_title} @ ${mins}:${String(secs).padStart(2, '0')}]`
+      : `[${mins}:${String(secs).padStart(2, '0')}]`;
+    return `${prefix} ${c.text}`;
+  }).join('\n');
+
+  const summaryCtx = summaries.length > 0
+    ? '\n\nSummaries:\n' + summaries.map(s => {
+        const label = s.session_title ? `[${s.session_title}]` : '';
+        return `${label} ${s.summary_text}`;
+      }).join('\n\n')
+    : '';
+
+  const system = `You answer questions about lectures and meetings using only the provided transcript context.
+${crossSession ? 'The context may span multiple sessions, so explicitly mention which session the answer came from when relevant.' : ''}
+Reference timestamps when possible. Be precise. If the answer is not supported by the context, say so clearly.`;
+
+  return callGemini(
+    apiKey,
+    system,
+    `Transcript:\n${context}${summaryCtx}\n\n---\nQuestion: ${question}`,
+    {
+      maxOutputTokens: 1024,
+      thinkingLevel: 'low',
+    },
+  );
+}
+
+// ── Auto-title generation ──
+export async function generateSessionTitle(apiKey, chunks) {
+  const text = chunks.slice(0, 30).map(c => c.text).join(' ').substring(0, 1500);
+  const system = 'Generate a concise title for a recording session. Return only the title, 3 to 8 words, with no quotes or extra commentary.';
+
+  return callGemini(apiKey, system, `Transcript excerpt:\n"${text}"`, {
+    maxOutputTokens: 50,
+    thinkingLevel: 'minimal',
+  });
+}
+
+// ── Note Generation ──
+const NOTE_METHODS = {
+  cornell: {
+    name: 'Cornell Method',
+    system: `You are an expert note-taker using the Cornell Method. Structure notes as follows:
+
+## [Title]
+---
+
+### Cues / Questions | Notes
+Use a two-column format where:
+- LEFT side: Key questions, cue words, or prompts that trigger recall
+- RIGHT side: Detailed notes, explanations, examples
+
+Format each pair as:
+**Q: [question/cue]**
+[detailed notes for this topic]
+
+---
+
+### Summary
+Write a brief summary (3-5 sentences) of the entire lecture at the bottom.
+
+Keep notes concise. Use timestamps where relevant. Focus on main ideas, definitions, and relationships between concepts.`
+  },
+
+  outline: {
+    name: 'Outline Method',
+    system: `You are an expert note-taker using the Outline Method. Structure notes hierarchically:
+
+## [Title]
+
+Use indented bullet points to show relationships:
+- **Main Topic 1**
+  - Sub-point A
+    - Detail or example
+    - Detail or example
+  - Sub-point B
+    - Detail
+- **Main Topic 2**
+  - Sub-point A
+  - Sub-point B
+
+### Key Definitions
+List any important terms and their definitions.
+
+### Key Takeaways
+3-5 most important points from the lecture.
+
+Keep it scannable. Use timestamps for key moments. Focus on hierarchy and relationships between concepts.`
+  },
+};
+
+export function getNoteMethods() {
+  return Object.entries(NOTE_METHODS).map(([id, m]) => ({ id, name: m.name }));
+}
+
+export async function generateNotes(apiKey, chunks, summaries = [], method = 'cornell') {
+  const config = NOTE_METHODS[method] || NOTE_METHODS.cornell;
+
+  const transcript = chunks.map(c => {
     const mins = Math.floor(c.start_time / 60);
     const secs = Math.floor(c.start_time % 60);
     return `[${mins}:${String(secs).padStart(2, '0')}] ${c.text}`;
   }).join('\n');
 
-  const summaryContext = summaries.length > 0
-    ? '\n\nAvailable summaries:\n' + summaries.map(s =>
-        `[${s.summary_type}${s.topic_label ? ` - ${s.topic_label}` : ''}] ${s.summary_text}`
-      ).join('\n\n')
+  const summaryCtx = summaries.length > 0
+    ? '\n\nExisting summaries (for reference):\n' + summaries.map(s => s.summary_text).join('\n\n')
     : '';
 
-  const system = `You are a helpful assistant answering questions about a lecture/meeting.
-You have access to the transcript with timestamps and summaries.
-When answering:
-- Reference specific timestamps when possible (e.g., "Around 5:30, the speaker mentioned...")
-- Be precise and cite the transcript
-- If the answer isn't in the provided context, say so clearly
-- Keep answers concise but complete`;
+  const prompt = `Generate comprehensive notes from this lecture or meeting transcript.${summaryCtx}\n\nFull transcript:\n${transcript}`;
 
-  const prompt = `Transcript context:\n${context}${summaryContext}\n\n---\nQuestion: ${question}`;
-
-  return callClaude(apiKey, system, prompt, 1024);
+  return callGemini(apiKey, config.system, prompt, {
+    maxOutputTokens: 4096,
+    thinkingLevel: 'medium',
+  });
 }
