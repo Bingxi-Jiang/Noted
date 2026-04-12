@@ -129,4 +129,4 @@ Connect to `ws://localhost:3000/ws`
 - [ ] Meeting mode default name is "speaker 2"
 - [ ] Chinese words in Meeting notes
 - [ ] Latex not displaying in notes
- 
+- [ ] Session did not load audio

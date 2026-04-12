@@ -409,6 +409,41 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .btn.screen-active { border-color:var(--cyan); color:var(--cyan); background:rgba(34,211,238,.08); }
 .btn.screen-active:hover { background:rgba(34,211,238,.15); }
 
+/* ── Concept cards ── */
+.concept-card {
+  background:var(--surface-2); border:1px solid var(--border); border-radius:8px;
+  margin-bottom:8px; overflow:hidden; animation:fadeIn .3s;
+}
+.concept-card-header {
+  display:flex; align-items:center; gap:8px; padding:10px 12px;
+  cursor:pointer; transition:background .12s;
+}
+.concept-card-header:hover { background:var(--surface-3); }
+.concept-card-header .cc-num {
+  width:22px; height:22px; border-radius:50%; background:var(--accent);
+  color:#fff; font-family:var(--mono); font-size:10px; font-weight:700;
+  display:flex; align-items:center; justify-content:center; flex-shrink:0;
+}
+.concept-card-header .cc-title {
+  flex:1; font-size:13px; font-weight:600; color:var(--text);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.concept-card-header .cc-time {
+  font-family:var(--mono); font-size:10px; color:var(--text-muted); flex-shrink:0;
+}
+.concept-card-header .cc-chevron {
+  color:var(--text-muted); font-size:10px; transition:transform .15s; flex-shrink:0;
+}
+.concept-card.expanded .cc-chevron { transform:rotate(90deg); }
+.concept-card-body {
+  display:none; padding:0 12px 12px; font-size:12px; line-height:1.6;
+  color:var(--text-dim); white-space:pre-wrap;
+}
+.concept-card.expanded .concept-card-body { display:block; }
+.concept-card-body h2 { font-size:14px; color:var(--text); margin:8px 0 4px; }
+.concept-card-body h3 { font-size:13px; color:var(--text); margin:6px 0 3px; }
+.concept-card-body strong { color:var(--text); }
+
 .screen-preview-strip {
   display:none; padding:6px 16px; background:var(--surface);
   border-bottom:1px solid var(--border); align-items:center; gap:10px;
@@ -474,6 +509,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       <button class="btn" id="btnScreen" style="display:none" onclick="toggleScreenShare()">🖥️ Screen</button>
       <button class="btn primary" id="btnRec" style="display:none" onclick="startRecording()">Record</button>
       <button class="btn stop" id="btnStop" style="display:none" onclick="stopRecording()">Stop</button>
+      <button class="btn" id="btnConcepts" style="display:none" onclick="toggleConcepts()">📖 Concepts</button>
       <button class="btn" id="btnNotes" style="display:none" onclick="toggleNotes()">Notes</button>
     </div>
 
@@ -502,12 +538,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
         <div class="transcript-toolbar">
           <h3 id="transcriptTitle">Transcript</h3>
           <div style="display:flex;gap:6px">
-            <button class="btn" onclick="triggerSummary()" title="Generate summary now" style="font-size:10px">Summarize</button>
-            <select id="summaryMode" onchange="updateSettings()" style="padding:3px 6px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:10px">
-              <option value="time">Auto: Time</option>
-              <option value="topic">Auto: Topic</option>
-              <option value="manual">Manual</option>
-            </select>
+            <button class="btn" id="btnConceptRecap" onclick="triggerConceptRecap()" title="Detect and summarize the latest concept" style="font-size:10px">📖 Concept Recap</button>
           </div>
           <div class="view-toggle">
             <button class="active" onclick="setView('split',this)">Split</button>
@@ -533,6 +564,21 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
         <div class="qa-bar">
           <input type="text" id="qaInput" placeholder="Ask about this session..." onkeydown="if(event.key==='Enter')askQuestion()">
           <button class="btn primary" onclick="askQuestion()">Ask</button>
+        </div>
+      </div>
+
+      <!-- Concepts panel (live concept recap cards) -->
+      <div class="notes-panel hidden" id="conceptsPanel" style="--notes-w:340px;width:340px;min-width:340px">
+        <div class="notes-header">
+          <h3>📖 Concept Recaps</h3>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--text-muted)" id="conceptCount">0 concepts</span>
+        </div>
+        <div class="notes-content" id="conceptsContent" style="padding:8px">
+          <div class="empty-msg">
+            <div class="em-icon">📖</div>
+            Concept recaps appear here automatically as the lecture progresses.<br><br>
+            <span style="font-size:11px;color:var(--text-muted)">You can also click "📖 Concept Recap" above the transcript to manually trigger detection.</span>
+          </div>
         </div>
       </div>
 
@@ -642,6 +688,8 @@ const finals = [], summaries = [];
 let folders = [], sessions = [];
 let activeSessionId = null;
 let notesVisible = false;
+let conceptsVisible = false;
+const conceptRecaps = []; // { concept_title, content, start_time, end_time }
 let currentSessionMode = 'lecture'; // 'lecture' or 'meeting'
 let speakerNameMap = {}; // { speaker_0: 'Paul', speaker_1: 'Lisa', ... }
 let modeChooserFolderId = null;
@@ -741,6 +789,7 @@ async function openSession(sid) {
   speakerNameMap = {};
   screenCaptureEntries.length = 0;
   screenCaptureCount = 0;
+  conceptRecaps.length = 0;
 
   const [session, chunks, sums, note, spkMap, scrCaps] = await Promise.all([
     fetch(`/api/sessions/${sid}`).then(r=>r.json()),
@@ -759,7 +808,12 @@ async function openSession(sid) {
   }
 
   chunks.forEach(c => finals.push({ text:c.text, start:c.start_time, end:c.end_time, speaker:c.speaker }));
-  sums.forEach(s => summaries.push(s));
+  sums.forEach(s => {
+    summaries.push(s);
+    if (s.summary_type === 'concept') {
+      conceptRecaps.push({ concept_title: s.topic_label || 'Concept', content: s.summary_text, start_time: s.start_time, end_time: s.end_time });
+    }
+  });
 
   // Show session view
   document.getElementById('homeView').style.display = 'none';
@@ -776,6 +830,7 @@ async function openSession(sid) {
 
   // Show/hide mode-specific controls
   document.getElementById('btnNotes').style.display = '';
+  document.getElementById('btnConcepts').style.display = '';
   document.getElementById('btnRec').style.display = '';
   document.getElementById('btnStop').style.display = 'none';
   document.getElementById('recBadge').style.display = '';
@@ -810,6 +865,7 @@ async function openSession(sid) {
   updateNoteMethodOptions();
 
   renderTranscript();
+  renderConcepts();
   if (note) {
     document.getElementById('notesContent').innerHTML = renderMarkdown(note.content);
     document.getElementById('noteMethod').value = note.method || (currentSessionMode === 'meeting' ? 'meeting' : 'cornell');
@@ -915,7 +971,7 @@ async function startRecording() {
     ws.send(JSON.stringify({
       type:'start_session', session_id:sessionId,
       session_mode: currentSessionMode,
-      summary_mode: document.getElementById('summaryMode').value,
+      summary_mode: 'concept',
       summary_interval: 5,
     }));
 
@@ -1031,6 +1087,16 @@ function handleWSMessage(msg) {
         document.getElementById('screenCaptureCount').textContent = `${screenCaptureCount} captures analyzed`;
         renderTranscript();
       }
+      break;
+    case 'concept_recap':
+      conceptRecaps.push({
+        concept_title: msg.data.concept_title,
+        content: msg.data.content,
+        start_time: msg.data.start_time,
+        end_time: msg.data.end_time,
+      });
+      renderConcepts();
+      if (!conceptsVisible) toggleConcepts();
       break;
     case 'error':
       console.error('[Server]',msg.data.message); break;
@@ -1230,17 +1296,63 @@ async function generateNotes(){
 }
 
 function updateSettings(){
-  if(ws&&ws.readyState===WebSocket.OPEN){
-    ws.send(JSON.stringify({type:'update_settings',summary_mode:document.getElementById('summaryMode').value}));
-  }
+  // kept as no-op for compatibility
 }
 
-async function triggerSummary(){
-  if(!sessionId) return;
-  try{
-    const r=await fetch(`/api/sessions/${sessionId}/summarize`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'all'})});
-    await r.json();
-  }catch(e){alert(e.message);}
+// ══════════════════════════════════════════════════════
+//  Concepts Panel
+// ══════════════════════════════════════════════════════
+function toggleConcepts() {
+  conceptsVisible = !conceptsVisible;
+  document.getElementById('conceptsPanel').classList.toggle('hidden', !conceptsVisible);
+}
+
+function renderConcepts() {
+  const el = document.getElementById('conceptsContent');
+  document.getElementById('conceptCount').textContent = `${conceptRecaps.length} concept${conceptRecaps.length !== 1 ? 's' : ''}`;
+  if (conceptRecaps.length === 0) {
+    el.innerHTML = `<div class="empty-msg"><div class="em-icon">📖</div>Concept recaps appear here automatically as the lecture progresses.<br><br><span style="font-size:11px;color:var(--text-muted)">You can also click "📖 Concept Recap" above the transcript to trigger manually.</span></div>`;
+    return;
+  }
+  el.innerHTML = conceptRecaps.map((c, i) => {
+    const expanded = i === conceptRecaps.length - 1 ? ' expanded' : '';
+    return `<div class="concept-card${expanded}" onclick="this.classList.toggle('expanded')">
+      <div class="concept-card-header">
+        <span class="cc-num">${i + 1}</span>
+        <span class="cc-title">${esc(c.concept_title)}</span>
+        <span class="cc-time">${fmt(c.start_time)} – ${fmt(c.end_time)}</span>
+        <span class="cc-chevron">▸</span>
+      </div>
+      <div class="concept-card-body">${renderMarkdown(c.content)}</div>
+    </div>`;
+  }).join('');
+}
+
+async function triggerConceptRecap() {
+  if (!sessionId) return;
+  const btn = document.getElementById('btnConceptRecap');
+  const origText = btn.textContent;
+  btn.textContent = '⏳ Detecting…';
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/sessions/${sessionId}/concept-recap`, { method: 'POST' });
+    const d = await r.json();
+    if (d.skipped) {
+      // Show a brief inline message instead of alert
+      btn.textContent = '— No boundary found';
+      setTimeout(() => { btn.textContent = origText; }, 2500);
+      return;
+    }
+    // If successful, the WS broadcast will trigger renderConcepts
+  } catch (e) {
+    btn.textContent = '❌ Error';
+    setTimeout(() => { btn.textContent = origText; }, 2500);
+    console.error('[ConceptRecap]', e.message);
+  } finally {
+    btn.disabled = false;
+    // Restore text after delay if not already restored
+    setTimeout(() => { if (btn.textContent.startsWith('⏳')) btn.textContent = origText; }, 10000);
+  }
 }
 
 // ══════════════════════════════════════════════════════

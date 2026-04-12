@@ -20,7 +20,8 @@ import {
 import { createTranscriber } from './transcriber.js';
 import {
   generateRollingSummary, detectTopicChange, answerQuestion,
-  generateSessionTitle, generateNotes, getNoteMethods, analyzeScreenCapture
+  generateSessionTitle, generateNotes, getNoteMethods, analyzeScreenCapture,
+  detectConceptBoundary, generateConceptRecap
 } from './summarizer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -202,23 +203,43 @@ app.post('/api/folders/:id/ask', async (req, res) => {
   }
 });
 
-// ══════════════ Summary trigger ══════════════
-app.post('/api/sessions/:id/summarize', async (req, res) => {
+// ══════════════ Concept Recap (manual trigger) ══════════════
+app.post('/api/sessions/:id/concept-recap', async (req, res) => {
   if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
   try {
     const sid = req.params.id;
-    const { mode, minutes } = req.body;
-    let chunks = (mode === 'time' && minutes) ? getRecentChunks(sid, minutes * 60) : getAllChunks(sid);
-    if (chunks.length === 0) return res.json({ summary: 'No transcript data yet.' });
-    const startTime = chunks[0].start_time;
-    const endTime = chunks[chunks.length - 1].end_time;
-    const prev = getLatestSummary(sid);
-    const summary = await generateRollingSummary(GEMINI_KEY, chunks, prev?.summary_text);
-    insertSummary(sid, summary, startTime, endTime, mode === 'topic' ? 'topic' : 'rolling');
-    broadcastToSession(sid, { type: 'summary', data: { summary_text: summary, start_time: startTime, end_time: endTime, summary_type: mode } });
-    res.json({ summary, start_time: startTime, end_time: endTime });
+    const chunks = getAllChunks(sid);
+    if (chunks.length === 0) return res.json({ error: 'No transcript data yet.' });
+
+    // Get recent chunks to detect concept
+    const recent = chunks.slice(-Math.min(chunks.length, 50));
+    const existingSummaries = getSummaries(sid).filter(s => s.summary_type === 'concept');
+    const existingConcepts = existingSummaries.map(s => s.topic_label).filter(Boolean);
+
+    const boundary = await detectConceptBoundary(GEMINI_KEY, recent, existingConcepts);
+    if (!boundary.changed || !boundary.concept_title) {
+      return res.json({ skipped: true, reason: 'No clear concept boundary detected in recent content.' });
+    }
+
+    // Find start point (after last concept or beginning)
+    const lastConceptEnd = existingSummaries.length > 0
+      ? existingSummaries[existingSummaries.length - 1].end_time
+      : 0;
+    const conceptChunks = chunks.filter(c => c.start_time >= lastConceptEnd);
+    if (conceptChunks.length < 3) return res.json({ skipped: true, reason: 'Not enough new content since last concept.' });
+
+    const startTime = conceptChunks[0].start_time;
+    const endTime = conceptChunks[conceptChunks.length - 1].end_time;
+    const recap = await generateConceptRecap(GEMINI_KEY, conceptChunks, boundary.concept_title);
+
+    insertSummary(sid, recap, startTime, endTime, 'concept', boundary.concept_title);
+    broadcastToSession(sid, {
+      type: 'concept_recap',
+      data: { concept_title: boundary.concept_title, content: recap, start_time: startTime, end_time: endTime }
+    });
+    res.json({ concept_title: boundary.concept_title, content: recap, start_time: startTime, end_time: endTime });
   } catch (err) {
-    console.error('[Summary]', err.message);
+    console.error('[ConceptRecap]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -311,6 +332,10 @@ wss.on('connection', (ws) => {
             summaryMode: msg.summary_mode || 'time',
             summaryInterval: msg.summary_interval || 5,
             sessionMode,
+            // Concept recap state
+            lastConceptTime: 0,
+            detectedConcepts: [],
+            conceptCheckPending: false,
           });
         }
         const session = activeSessions.get(sessionId);
@@ -406,36 +431,51 @@ wss.on('connection', (ws) => {
 
 async function maybeAutoSummarize(sessionId, session, currentTime) {
   if (!GEMINI_KEY) return;
-  if (session.summaryMode === 'time') {
-    if (currentTime - session.lastSummaryTime >= session.summaryInterval * 60) {
-      try {
-        const chunks = getChunks(sessionId, session.lastSummaryTime, currentTime);
-        if (chunks.length < 3) return;
-        const prev = getLatestSummary(sessionId);
-        const summary = await generateRollingSummary(GEMINI_KEY, chunks, prev?.summary_text);
-        insertSummary(sessionId, summary, session.lastSummaryTime, currentTime, 'rolling');
-        session.lastSummaryTime = currentTime;
-        broadcastToSession(sessionId, { type: 'summary', data: { summary_text: summary, start_time: chunks[0].start_time, end_time: currentTime, summary_type: 'rolling' } });
-      } catch (err) { console.error('[AutoSum]', err.message); }
-    }
-  } else if (session.summaryMode === 'topic' && session.chunkCount % 10 === 0) {
-    try {
-      const recent = getRecentChunks(sessionId, 120);
-      if (recent.length < 3) return;
-      const result = await detectTopicChange(GEMINI_KEY, recent, session.currentTopic);
-      if (result.changed) {
-        const chunks = getChunks(sessionId, session.lastSummaryTime, currentTime);
-        if (chunks.length > 0) {
-          const prev = getLatestSummary(sessionId);
-          const summary = await generateRollingSummary(GEMINI_KEY, chunks, prev?.summary_text);
-          insertSummary(sessionId, summary, session.lastSummaryTime, currentTime, 'topic', result.topic);
-          session.lastSummaryTime = currentTime;
-          session.currentTopic = result.topic;
-          broadcastToSession(sessionId, { type: 'summary', data: { summary_text: summary, start_time: chunks[0].start_time, end_time: currentTime, summary_type: 'topic', topic_label: result.topic } });
-          broadcastToSession(sessionId, { type: 'topic_change', data: { topic: result.topic } });
+
+  // ── Concept Recap Detection ──
+  // Only check every 15 chunks, and enforce minimum 2 minutes between concepts
+  const MIN_CONCEPT_GAP = 120; // seconds
+  const CHECK_EVERY_N_CHUNKS = 15;
+
+  if (session.chunkCount % CHECK_EVERY_N_CHUNKS !== 0) return;
+  if (currentTime - session.lastConceptTime < MIN_CONCEPT_GAP) return;
+  if (session.conceptCheckPending) return;
+
+  session.conceptCheckPending = true;
+  try {
+    // Get recent chunks (last ~3 minutes)
+    const recent = getRecentChunks(sessionId, 180);
+    if (recent.length < 5) { session.conceptCheckPending = false; return; }
+
+    const boundary = await detectConceptBoundary(GEMINI_KEY, recent, session.detectedConcepts);
+
+    if (boundary.changed && boundary.concept_title) {
+      // Get chunks since last concept for the recap content
+      const conceptChunks = getChunks(sessionId, session.lastConceptTime, currentTime);
+      if (conceptChunks.length < 3) { session.conceptCheckPending = false; return; }
+
+      const recap = await generateConceptRecap(GEMINI_KEY, conceptChunks, boundary.concept_title);
+
+      // Store as a summary with type 'concept'
+      insertSummary(sessionId, recap, session.lastConceptTime, currentTime, 'concept', boundary.concept_title);
+
+      session.lastConceptTime = currentTime;
+      session.detectedConcepts.push(boundary.concept_title);
+
+      broadcastToSession(sessionId, {
+        type: 'concept_recap',
+        data: {
+          concept_title: boundary.concept_title,
+          content: recap,
+          start_time: conceptChunks[0].start_time,
+          end_time: currentTime,
         }
-      }
-    } catch (err) { console.error('[TopicDetect]', err.message); }
+      });
+    }
+  } catch (err) {
+    console.error('[ConceptRecap]', err.message);
+  } finally {
+    session.conceptCheckPending = false;
   }
 }
 

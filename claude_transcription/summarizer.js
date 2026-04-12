@@ -148,7 +148,7 @@ function safeJsonParse(raw, fallback) {
   }
 }
 
-// ── Rolling Summary ──
+// ── Rolling Summary (kept for internal use / notes context) ──
 export async function generateRollingSummary(apiKey, chunks, previousSummary = null) {
   const transcript = chunks.map(c => {
     const mins = Math.floor(c.start_time / 60);
@@ -167,6 +167,75 @@ If a previous summary is provided, extend it with only genuinely new information
 
   return callGemini(apiKey, system, prompt, {
     maxOutputTokens: 1024,
+    thinkingLevel: 'low',
+  });
+}
+
+// ── Concept Boundary Detection + Recap ──
+export async function detectConceptBoundary(apiKey, recentChunks, previousConcepts = []) {
+  const transcript = recentChunks.map(c => c.text).join(' ');
+  const prevList = previousConcepts.length > 0
+    ? previousConcepts.map(c => `- "${c}"`).join('\n')
+    : 'none';
+
+  const system = `You are analyzing a live lecture/presentation transcript to detect whether a COMPLETE concept or topic has just been explained.
+
+STRICT RULES — only output changed=true when ALL of these are met:
+1. The speaker has FINISHED explaining a distinct concept (not just mentioned it)
+2. There is a CLEAR transition signal: the speaker moves to a new topic, says "next", "moving on", "now let's look at", pauses significantly, or the content clearly shifts
+3. The completed concept is substantive enough to warrant a recap (not a brief aside or transition phrase)
+4. The concept is NOT already in the previous concepts list
+5. At least 3-5 minutes of content should have elapsed since the last concept was detected
+
+Be CONSERVATIVE. It is much better to miss a boundary than to fire too often.
+When in doubt, output changed=false.
+
+Respond with JSON only:
+{"changed": true/false, "concept_title": "short title of the completed concept", "reason": "why you detected a boundary"}`;
+
+  const raw = await callGemini(
+    apiKey,
+    system,
+    `Previous concepts already captured:\n${prevList}\n\nRecent transcript (last ~2-3 minutes):\n"${transcript}"`,
+    {
+      maxOutputTokens: 300,
+      thinkingLevel: 'low',
+      responseMimeType: 'application/json',
+    },
+  );
+
+  return safeJsonParse(raw, {
+    changed: false,
+    concept_title: '',
+    reason: '',
+  });
+}
+
+export async function generateConceptRecap(apiKey, chunks, conceptTitle) {
+  const transcript = chunks.map(c => {
+    const mins = Math.floor(c.start_time / 60);
+    const secs = Math.floor(c.start_time % 60);
+    return `[${mins}:${String(secs).padStart(2, '0')}] ${c.text}`;
+  }).join('\n');
+
+  const system = `You are generating a CONCEPT RECAP card for a lecture. This card should be a quick-reference summary of ONE specific concept that was just explained.
+
+Output in this exact structure (use the same language as the transcript):
+
+## ${conceptTitle}
+
+**Core Idea:** One sentence explaining the concept in plain language.
+
+**Key Details:**
+- 2-4 bullet points with the most important facts, formulas, or relationships
+- Include any definitions, examples, or analogies the speaker used
+
+**Why It Matters:** One sentence on significance or how it connects to the bigger picture.
+
+Keep it SHORT and DENSE — this is a flashcard-style recap, not a full summary. Max 150 words total.`;
+
+  return callGemini(apiKey, system, `Transcript covering this concept:\n${transcript}`, {
+    maxOutputTokens: 512,
     thinkingLevel: 'low',
   });
 }
