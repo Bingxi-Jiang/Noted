@@ -153,18 +153,19 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .mode-badge.lecture { background:var(--accent-dim); color:var(--accent); }
 .mode-badge.meeting { background:var(--orange-dim); color:var(--orange); }
 
-/* Audio source toggle */
-.src-toggle {
-  display:flex; border-radius:5px; overflow:hidden; border:1px solid var(--border);
+/* Lecture audio controls */
+.source-controls {
+  display:flex; align-items:center; gap:8px;
 }
-.src-toggle button {
-  padding:3px 8px; font-family:var(--mono); font-size:10px;
-  background:transparent; border:none; color:var(--text-muted);
-  cursor:pointer; transition:all .12s;
+.source-chip {
+  display:flex; align-items:center; gap:6px; padding:4px 10px;
+  border-radius:6px; border:1px solid var(--border-light);
+  background:var(--accent-dim); color:var(--accent);
+  font-family:var(--mono); font-size:10px; font-weight:600;
 }
-.src-toggle button:hover { color:var(--text-dim); }
-.src-toggle button.active { background:var(--accent); color:#fff; }
-.src-toggle button + button { border-left:1px solid var(--border); }
+.source-chip .dot {
+  width:7px; height:7px; border-radius:50%; background:currentColor;
+}
 
 .btn {
   padding:5px 14px; border-radius:5px; border:1px solid var(--border);
@@ -260,7 +261,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .spk-6 { background:#22d3ee22; color:#22d3ee; }
 .spk-7 { background:#e879f922; color:#e879f9; }
 
-/* Mic toggle for lecture mode */
+/* Mic toggle for both modes */
 .mic-toggle {
   display:flex; align-items:center; gap:6px; padding:4px 10px;
   border-radius:6px; border:1px solid var(--border); background:var(--surface-2);
@@ -503,11 +504,16 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       <div class="rec-badge idle" id="recBadge" style="display:none">
         <span class="dot"></span><span id="recStatus">Idle</span>
       </div>
-      <!-- Lecture mode: system audio primary, optional mic -->
-      <div class="src-toggle" id="srcToggle" style="display:none">
-        <button class="active" onclick="selectSource('mic',this)">Mic</button>
-        <button onclick="selectSource('system',this)">System</button>
-        <button onclick="selectSource('both',this)">Both</button>
+      <!-- System audio is primary in both modes; mic can be toggled independently -->
+      <div class="source-controls" id="sourceControls" style="display:none">
+        <div class="source-chip" id="systemSourceChip">
+          <span class="dot"></span>
+          <span>System Audio</span>
+        </div>
+        <button class="mic-toggle" id="btnMicToggle" onclick="toggleMic()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 1 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
+          <span id="micToggleLabel">Mic Off</span>
+        </button>
       </div>
       <!-- Meeting mode: speakers button -->
       <button class="btn meeting-btn" id="btnSpeakers" style="display:none" onclick="showSpeakerModal()">👥 Speakers</button>
@@ -525,17 +531,17 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       <div class="home-view" id="homeView">
         <div class="hero-icon">🎙️</div>
         <h2>Ready to capture</h2>
-        <p>Choose a mode to start recording. Lecture mode focuses on note-taking from system audio. Meeting mode identifies different speakers.</p>
+        <p>Choose a mode to start recording. Both modes record system audio by default, and you can turn your mic on or off whenever you want. Meeting mode still keeps speaker diarization and per-person tracking.</p>
         <div class="mode-selector">
           <div class="mode-card lecture" onclick="newRecording(null,'lecture')">
             <div class="mc-icon">📚</div>
             <div class="mc-title">Lecture Mode</div>
-            <div class="mc-desc">System audio capture with deep concept notes (Cornell / Outline)</div>
+            <div class="mc-desc">System audio by default, plus optional live mic capture</div>
           </div>
           <div class="mode-card meeting" onclick="newRecording(null,'meeting')">
             <div class="mc-icon">🤝</div>
             <div class="mc-title">Meeting Mode</div>
-            <div class="mc-desc">Speaker diarization with per-person tracking & meeting minutes</div>
+            <div class="mc-desc">System audio by default, plus optional mic with speaker diarization</div>
           </div>
         </div>
       </div>
@@ -762,7 +768,21 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 // ══════════════════════════════════════════════════════
 let ws = null, audioContext = null, sessionId = null, isRecording = false;
 let startTimestamp = null, timerInterval = null;
-let selectedSource = 'mic', activeStreams = [];
+let activeStreams = [];
+let lectureMicEnabled = false;
+let lectureAudioState = {
+  mixedStream: null,
+  systemStream: null,
+  systemSourceNode: null,
+  systemGainNode: null,
+  micStream: null,
+  micSourceNode: null,
+  micGainNode: null,
+  mixDestination: null,
+  mixSourceNode: null,
+  processorNode: null,
+  sinkGainNode: null,
+};
 let currentView = 'split', currentPartialText = '', currentPartialSpeaker = 'speaker_0';
 const finals = [], summaries = [];
 let folders = [], sessions = [];
@@ -930,22 +950,10 @@ async function openSession(sid) {
   document.getElementById('btnScreen').textContent = '🖥️ Screen';
   document.getElementById('screenCaptureCount').textContent = screenCaptureCount > 0 ? `${screenCaptureCount} captures analyzed` : '0 captures analyzed';
 
-  if (currentSessionMode === 'lecture') {
-    document.getElementById('srcToggle').style.display = '';
-    document.getElementById('btnSpeakers').style.display = 'none';
-    // Default to system audio for lecture mode
-    selectedSource = 'system';
-    document.querySelectorAll('.src-toggle button').forEach(b => {
-      b.classList.toggle('active', b.textContent === 'System');
-    });
-  } else {
-    document.getElementById('srcToggle').style.display = '';
-    document.getElementById('btnSpeakers').style.display = '';
-    selectedSource = 'mic';
-    document.querySelectorAll('.src-toggle button').forEach(b => {
-      b.classList.toggle('active', b.textContent === 'Mic');
-    });
-  }
+  document.getElementById('sourceControls').style.display = '';
+  document.getElementById('btnSpeakers').style.display = currentSessionMode === 'meeting' ? '' : 'none';
+  lectureMicEnabled = false;
+  updateMicUI();
 
   sessionId = sid;
 
@@ -1011,43 +1019,159 @@ async function newRecording(folderId = null, mode = 'lecture') {
 }
 
 // ══════════════════════════════════════════════════════
-//  Audio source
+//  Audio controls
 // ══════════════════════════════════════════════════════
-function selectSource(src, btn) {
-  if (isRecording) return;
-  selectedSource = src;
-  document.querySelectorAll('.src-toggle button').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
+function updateMicUI() {
+  const btn = document.getElementById('btnMicToggle');
+  const label = document.getElementById('micToggleLabel');
+  if (!btn || !label) return;
+  btn.classList.toggle('active', lectureMicEnabled);
+  label.textContent = lectureMicEnabled ? 'Mic On' : 'Mic Off';
+  btn.title = lectureMicEnabled ? 'Turn microphone off' : 'Turn microphone on';
 }
 
-async function getAudioStream() {
-  if (selectedSource === 'mic') {
-    const s = await navigator.mediaDevices.getUserMedia({ audio:{channelCount:1,sampleRate:16000,echoCancellation:true,noiseSuppression:true} });
-    activeStreams.push(s); return s;
+function addStreamToActiveStreams(stream) {
+  if (!stream) return;
+  if (!activeStreams.includes(stream)) activeStreams.push(stream);
+}
+
+function removeStreamFromActiveStreams(stream) {
+  activeStreams = activeStreams.filter(s => s !== stream);
+}
+
+function teardownLectureMic({ stopTracks = true } = {}) {
+  if (lectureAudioState.micSourceNode) {
+    try { lectureAudioState.micSourceNode.disconnect(); } catch {}
+    lectureAudioState.micSourceNode = null;
   }
-  if (selectedSource === 'system') {
-    const s = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true, systemAudio:'include' });
-    s.getVideoTracks().forEach(t=>t.stop());
-    if (!s.getAudioTracks().length) { s.getTracks().forEach(t=>t.stop()); throw new Error('No system audio. Check "Share audio" in the prompt.'); }
-    activeStreams.push(s); return s;
+  if (lectureAudioState.micGainNode) {
+    try { lectureAudioState.micGainNode.disconnect(); } catch {}
+    lectureAudioState.micGainNode = null;
   }
-  if (selectedSource === 'both') {
-    const mic = await navigator.mediaDevices.getUserMedia({ audio:{channelCount:1,sampleRate:16000,echoCancellation:true,noiseSuppression:true} });
-    activeStreams.push(mic);
-    let sys;
+  if (lectureAudioState.micStream) {
+    if (stopTracks) lectureAudioState.micStream.getTracks().forEach(t => t.stop());
+    removeStreamFromActiveStreams(lectureAudioState.micStream);
+    lectureAudioState.micStream = null;
+  }
+}
+
+async function enableLectureMic() {
+  if (lectureAudioState.micStream || !audioContext || !lectureAudioState.mixDestination) {
+    lectureMicEnabled = true;
+    updateMicUI();
+    return;
+  }
+
+  const micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
+  });
+
+  const micSourceNode = audioContext.createMediaStreamSource(micStream);
+  const micGainNode = audioContext.createGain();
+  micGainNode.gain.value = 1;
+  micSourceNode.connect(micGainNode).connect(lectureAudioState.mixDestination);
+
+  lectureAudioState.micStream = micStream;
+  lectureAudioState.micSourceNode = micSourceNode;
+  lectureAudioState.micGainNode = micGainNode;
+  addStreamToActiveStreams(micStream);
+
+  micStream.getAudioTracks().forEach(track => {
+    track.addEventListener('ended', () => {
+      teardownLectureMic({ stopTracks: false });
+      lectureMicEnabled = false;
+      updateMicUI();
+    });
+  });
+
+  lectureMicEnabled = true;
+  updateMicUI();
+}
+
+async function disableLectureMic() {
+  teardownLectureMic();
+  lectureMicEnabled = false;
+  updateMicUI();
+}
+
+async function toggleMic() {
+
+  if (!isRecording) {
+    lectureMicEnabled = !lectureMicEnabled;
+    updateMicUI();
+    return;
+  }
+
+  const btn = document.getElementById('btnMicToggle');
+  if (btn) btn.disabled = true;
+
+  try {
+    if (lectureMicEnabled) {
+      await disableLectureMic();
+    } else {
+      await enableLectureMic();
+    }
+  } catch (err) {
+    console.error('[Mic Toggle]', err);
+    alert('Could not toggle microphone: ' + err.message);
+    lectureMicEnabled = Boolean(lectureAudioState.micStream);
+    updateMicUI();
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function getMeetingAudioStream() {
+  return getLectureAudioStream();
+}
+
+async function getLectureAudioStream() {
+  const systemStream = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: true,
+    systemAudio: 'include',
+  });
+  systemStream.getVideoTracks().forEach(t => t.stop());
+
+  if (!systemStream.getAudioTracks().length) {
+    systemStream.getTracks().forEach(t => t.stop());
+    throw new Error('No system audio. Check "Share audio" in the prompt.');
+  }
+
+  addStreamToActiveStreams(systemStream);
+
+  audioContext = new AudioContext({ sampleRate: 16000 });
+  const mixDestination = audioContext.createMediaStreamDestination();
+  const systemSourceNode = audioContext.createMediaStreamSource(systemStream);
+  const systemGainNode = audioContext.createGain();
+  systemGainNode.gain.value = 1;
+  systemSourceNode.connect(systemGainNode).connect(mixDestination);
+
+  lectureAudioState = {
+    mixedStream: mixDestination.stream,
+    systemStream,
+    systemSourceNode,
+    systemGainNode,
+    micStream: null,
+    micSourceNode: null,
+    micGainNode: null,
+    mixDestination,
+    mixSourceNode: null,
+    processorNode: null,
+    sinkGainNode: null,
+  };
+
+  if (lectureMicEnabled) {
     try {
-      sys = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:true, systemAudio:'include' });
-      sys.getVideoTracks().forEach(t=>t.stop()); activeStreams.push(sys);
-    } catch(e) { console.warn('System audio unavailable, using mic only'); return mic; }
-    if (!sys.getAudioTracks().length) { sys.getTracks().forEach(t=>t.stop()); return mic; }
-    const ctx = new AudioContext({sampleRate:16000});
-    const dest = ctx.createMediaStreamDestination();
-    ctx.createMediaStreamSource(mic).connect(ctx.createGain()).connect(dest);
-    ctx.createMediaStreamSource(sys).connect(ctx.createGain()).connect(dest);
-    activeStreams._mixCtx = ctx;
-    return dest.stream;
+      await enableLectureMic();
+    } catch (err) {
+      console.warn('[Lecture Mic] Falling back to system audio only:', err.message);
+      lectureMicEnabled = false;
+      updateMicUI();
+    }
   }
-  throw new Error('Unknown source');
+
+  return mixDestination.stream;
 }
 
 // ══════════════════════════════════════════════════════
@@ -1056,7 +1180,10 @@ async function getAudioStream() {
 async function startRecording() {
   if (!sessionId) return;
   try {
-    const stream = await getAudioStream();
+    const stream = currentSessionMode === 'lecture'
+      ? await getLectureAudioStream()
+      : await getMeetingAudioStream();
+
     const proto = location.protocol==='https:'?'wss:':'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
     ws.binaryType = 'arraybuffer';
@@ -1088,10 +1215,14 @@ async function startRecording() {
       setTimeout(()=>{ ws.onmessage=orig; res(); }, 8000);
     });
 
-    // Start audio pipeline
-    audioContext = new AudioContext({sampleRate:16000});
+    if (!audioContext) {
+      audioContext = new AudioContext({ sampleRate: 16000 });
+    }
+
     const src = audioContext.createMediaStreamSource(stream);
     const proc = audioContext.createScriptProcessor(4096,1,1);
+    const sinkGain = audioContext.createGain();
+    sinkGain.gain.value = 0;
     proc.onaudioprocess = (e) => {
       if(!ws||ws.readyState!==WebSocket.OPEN) return;
       const f=e.inputBuffer.getChannelData(0);
@@ -1099,9 +1230,19 @@ async function startRecording() {
       for(let x=0;x<f.length;x++) i[x]=Math.max(-32768,Math.min(32767,Math.floor(f[x]*32768)));
       ws.send(i.buffer);
     };
-    src.connect(proc); proc.connect(audioContext.destination);
+    src.connect(proc);
+    proc.connect(sinkGain);
+    sinkGain.connect(audioContext.destination);
 
-    activeStreams.forEach(s=>s.getAudioTracks().forEach(t=>t.addEventListener('ended',()=>{ if(isRecording)stopRecording(); })));
+    if (currentSessionMode === 'lecture') {
+      lectureAudioState.mixSourceNode = src;
+      lectureAudioState.processorNode = proc;
+      lectureAudioState.sinkGainNode = sinkGain;
+    }
+
+    activeStreams.forEach(s => s.getAudioTracks().forEach(t => t.addEventListener('ended', () => {
+      if (isRecording && s === lectureAudioState.systemStream) stopRecording();
+    })));
 
     isRecording = true;
     activeSessions_client.add(sessionId);
@@ -1111,7 +1252,7 @@ async function startRecording() {
     document.getElementById('btnStop').style.display='';
     document.getElementById('recBadge').className='rec-badge recording';
     document.getElementById('recStatus').textContent='Recording';
-    document.querySelectorAll('.src-toggle button').forEach(b=>{if(!b.classList.contains('active'))b.style.opacity='.3';b.style.pointerEvents='none';});
+    updateMicUI();
     renderSidebar();
   } catch(err) {
     console.error('[Start]',err);
@@ -1135,10 +1276,26 @@ function stopRecording() {
   document.getElementById('btnStop').style.display='none';
   document.getElementById('recBadge').className='rec-badge idle';
   document.getElementById('recStatus').textContent='Stopped';
-  document.querySelectorAll('.src-toggle button').forEach(b=>{b.style.opacity='';b.style.pointerEvents='';});
+  updateMicUI();
   renderSidebar();
 }
-function cleanupStreams(){activeStreams.forEach(s=>s.getTracks().forEach(t=>t.stop()));if(activeStreams._mixCtx){activeStreams._mixCtx.close().catch(()=>{});delete activeStreams._mixCtx;}activeStreams=[];}
+function cleanupStreams(){
+  activeStreams.forEach(s=>s.getTracks().forEach(t=>t.stop()));
+  activeStreams=[];
+  lectureAudioState = {
+    mixedStream: null,
+    systemStream: null,
+    systemSourceNode: null,
+    systemGainNode: null,
+    micStream: null,
+    micSourceNode: null,
+    micGainNode: null,
+    mixDestination: null,
+    mixSourceNode: null,
+    processorNode: null,
+    sinkGainNode: null,
+  };
+}
 function updateTimer(){const e=Math.floor((Date.now()-startTimestamp)/1000);document.getElementById('recTime').textContent=`${String(Math.floor(e/60)).padStart(2,'0')}:${String(e%60).padStart(2,'0')}`;}
 
 // ══════════════════════════════════════════════════════
