@@ -77,10 +77,15 @@ export async function initDB() {
     session_id TEXT NOT NULL,
     method TEXT DEFAULT 'cornell',
     content TEXT NOT NULL,
+    action_items TEXT DEFAULT '',
+    action_items_log TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (session_id) REFERENCES sessions(id)
   )`);
+
+  try { db.run(`ALTER TABLE notes ADD COLUMN action_items TEXT DEFAULT ''`); } catch (e) { /* exists */ }
+  try { db.run(`ALTER TABLE notes ADD COLUMN action_items_log TEXT DEFAULT ''`); } catch (e) { /* exists */ }
 
   // Speaker name mapping for meeting mode
   db.run(`CREATE TABLE IF NOT EXISTS speaker_names (
@@ -251,12 +256,12 @@ export function getLatestSummary(sessionId) {
 }
 
 // ── Notes ──
-export function upsertNote(id, sessionId, method, content) {
+export function upsertNote(id, sessionId, method, content, actionItems = '', actionItemsLog = '') {
   const existing = get('SELECT id FROM notes WHERE id = ?', [id]);
   if (existing) {
-    run('UPDATE notes SET content = ?, method = ?, updated_at = datetime("now") WHERE id = ?', [content, method, id]);
+    run('UPDATE notes SET content = ?, method = ?, action_items = ?, action_items_log = ?, updated_at = datetime("now") WHERE id = ?', [content, method, actionItems, actionItemsLog, id]);
   } else {
-    run('INSERT INTO notes (id, session_id, method, content) VALUES (?, ?, ?, ?)', [id, sessionId, method, content]);
+    run('INSERT INTO notes (id, session_id, method, content, action_items, action_items_log) VALUES (?, ?, ?, ?, ?, ?)', [id, sessionId, method, content, actionItems, actionItemsLog]);
   }
 }
 export function getNote(sessionId) {

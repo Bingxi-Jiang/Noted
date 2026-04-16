@@ -517,6 +517,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
       <button class="btn stop" id="btnStop" style="display:none" onclick="stopRecording()">Stop</button>
       <button class="btn" id="btnConcepts" style="display:none" onclick="toggleConcepts()">📖 Concepts</button>
       <button class="btn" id="btnNotes" style="display:none" onclick="toggleNotes()">Notes</button>
+      <button class="btn" id="btnActionItems" style="display:none" onclick="toggleActionItems()">Action Items</button>
     </div>
 
     <div class="content-area" id="contentArea">
@@ -602,6 +603,24 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
             Notes will be auto-generated when a session ends, or click Generate.
           </div>
         </div>
+      </div>
+
+      <!-- Action items panel -->
+      <div class="notes-panel hidden" id="actionItemsPanel" style="--notes-w:300px;width:300px;min-width:300px">
+        <div class="notes-header">
+          <h3>Action Items</h3>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--text-muted)" id="actionItemsCount">0 items</span>
+        </div>
+        <div class="notes-content" id="actionItemsContent">
+          <div class="empty-msg">
+            <div class="em-icon">✅</div>
+            Generate notes to extract action items.
+          </div>
+        </div>
+        <details id="actionItemsLogWrap" style="padding:10px 12px;border-top:1px solid var(--border);display:none">
+          <summary style="cursor:pointer;font-size:11px;font-weight:700;color:var(--text-muted)">Extraction Log</summary>
+          <pre id="actionItemsLog" style="margin-top:10px;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:10px;line-height:1.5;color:var(--text-muted)"></pre>
+        </details>
       </div>
     </div>
   </div>
@@ -749,10 +768,14 @@ const finals = [], summaries = [];
 let folders = [], sessions = [];
 let activeSessionId = null;
 let notesVisible = false;
+let actionItemsVisible = false;
 let conceptsVisible = false;
 const conceptRecaps = []; // { concept_title, content, start_time, end_time }
 let currentSessionMode = 'lecture'; // 'lecture' or 'meeting'
 let speakerNameMap = {}; // { speaker_0: 'Paul', speaker_1: 'Lisa', ... }
+let currentNoteContent = '';
+let currentActionItemsContent = '';
+let currentActionItemsLog = null;
 let modeChooserFolderId = null;
 
 // Screen sharing state
@@ -851,6 +874,9 @@ async function openSession(sid) {
   screenCaptureEntries.length = 0;
   screenCaptureCount = 0;
   conceptRecaps.length = 0;
+  currentNoteContent = '';
+  currentActionItemsContent = '';
+  currentActionItemsLog = null;
 
   const [session, chunks, sums, note, spkMap, scrCaps] = await Promise.all([
     fetch(`/api/sessions/${sid}`).then(r=>r.json()),
@@ -891,6 +917,7 @@ async function openSession(sid) {
 
   // Show/hide mode-specific controls
   document.getElementById('btnNotes').style.display = '';
+  document.getElementById('btnActionItems').style.display = '';
   document.getElementById('btnConcepts').style.display = '';
   document.getElementById('btnRec').style.display = '';
   document.getElementById('btnStop').style.display = 'none';
@@ -928,11 +955,18 @@ async function openSession(sid) {
   renderTranscript();
   renderConcepts();
   if (note) {
-    document.getElementById('notesContent').innerHTML = renderMarkdown(note.content);
+    currentNoteContent = note.content || '';
+    currentActionItemsContent = note.action_items || extractMarkdownSection(note.content || '', 'Action Items') || '';
+    currentActionItemsLog = parseStoredJson(note.action_items_log, null);
+    document.getElementById('notesContent').innerHTML = renderMarkdown(currentNoteContent);
     document.getElementById('noteMethod').value = note.method || (currentSessionMode === 'meeting' ? 'meeting' : 'cornell');
   } else {
+    currentNoteContent = '';
+    currentActionItemsContent = '';
+    currentActionItemsLog = null;
     document.getElementById('notesContent').innerHTML = `<div class="empty-msg"><div class="em-icon">📝</div>Notes will appear after the session ends, or click Generate.</div>`;
   }
+  renderActionItems();
   renderSidebar();
 }
 
@@ -1130,7 +1164,11 @@ function handleWSMessage(msg) {
         renderSidebar();
       } break;
     case 'notes_generated':
-      document.getElementById('notesContent').innerHTML=renderMarkdown(msg.data.content);
+      currentNoteContent = msg.data.content || '';
+      currentActionItemsContent = msg.data.action_items || '';
+      currentActionItemsLog = parseStoredJson(msg.data.action_items_log, null);
+      document.getElementById('notesContent').innerHTML=renderMarkdown(currentNoteContent);
+      renderActionItems();
       if(!notesVisible)toggleNotes(); break;
     case 'speaker_renamed':
       speakerNameMap[msg.data.speaker_key] = msg.data.display_name;
@@ -1343,6 +1381,113 @@ function toggleNotes(){
   document.getElementById('notesPanel').classList.toggle('hidden',!notesVisible);
 }
 
+function toggleActionItems(){
+  actionItemsVisible=!actionItemsVisible;
+  document.getElementById('actionItemsPanel').classList.toggle('hidden',!actionItemsVisible);
+}
+
+function normalizeHeadingText(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[：:]/g, '')
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseStoredJson(value, fallback = null) {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function extractMarkdownSection(md, targetHeading) {
+  if (!md) return '';
+  const lines = md.replace(/\r\n/g, '\n').split('\n');
+  const target = normalizeHeadingText(targetHeading);
+  let start = -1;
+  let headingLevel = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const match = lines[i].match(/^(#{2,6})\s+(.+)$/);
+    if (!match) continue;
+    const title = normalizeHeadingText(match[2]);
+    if (title === target) {
+      start = i + 1;
+      headingLevel = match[1].length;
+      break;
+    }
+  }
+
+  if (start === -1) return '';
+
+  let end = lines.length;
+  for (let i = start; i < lines.length; i++) {
+    const match = lines[i].match(/^(#{2,6})\s+(.+)$/);
+    if (match && match[1].length <= headingLevel) {
+      end = i;
+      break;
+    }
+  }
+
+  return lines.slice(start, end).join('\n').trim();
+}
+
+function countActionItems(section) {
+  if (!section) return 0;
+  const cleaned = section.trim();
+  if (/^-\s+none identified\s*$/im.test(cleaned)) return 0;
+  const matches = cleaned.match(/^(?:- \[ \]|- \[x\]|- )(?!None identified\b)/gim);
+  return matches ? matches.length : 0;
+}
+
+function renderActionItemsLog() {
+  const wrap = document.getElementById('actionItemsLogWrap');
+  const el = document.getElementById('actionItemsLog');
+  if (!currentActionItemsLog) {
+    wrap.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+
+  wrap.style.display = '';
+  const summary = currentActionItemsLog.summary ? `Summary: ${currentActionItemsLog.summary}` : 'Summary: No extraction summary available.';
+  const included = Array.isArray(currentActionItemsLog.included) && currentActionItemsLog.included.length
+    ? currentActionItemsLog.included.map((entry, idx) => `${idx + 1}. [${entry.timestamp || 'n/a'}] INCLUDED\n   Candidate: ${entry.candidate || ''}\n   Reason: ${entry.reason || ''}`).join('\n\n')
+    : 'None';
+  const excluded = Array.isArray(currentActionItemsLog.excluded) && currentActionItemsLog.excluded.length
+    ? currentActionItemsLog.excluded.map((entry, idx) => `${idx + 1}. [${entry.timestamp || 'n/a'}] EXCLUDED\n   Candidate: ${entry.candidate || ''}\n   Reason: ${entry.reason || ''}`).join('\n\n')
+    : 'None';
+
+  el.textContent = `${summary}\n\nIncluded Candidates\n-------------------\n${included}\n\nExcluded Candidates\n-------------------\n${excluded}`;
+  console.groupCollapsed('[Action Items] Extraction Log');
+  console.log(currentActionItemsLog);
+  console.groupEnd();
+}
+
+function renderActionItems() {
+  const el = document.getElementById('actionItemsContent');
+  const countEl = document.getElementById('actionItemsCount');
+  const content = currentActionItemsContent || extractMarkdownSection(currentNoteContent, 'Action Items');
+  const count = countActionItems(content);
+  countEl.textContent = `${count} item${count !== 1 ? 's' : ''}`;
+
+  if (!currentNoteContent && !currentActionItemsContent) {
+    el.innerHTML = `<div class="empty-msg"><div class="em-icon">✅</div>Generate notes to extract action items.</div>`;
+    renderActionItemsLog();
+    return;
+  }
+
+  if (!content) {
+    el.innerHTML = `<div class="empty-msg"><div class="em-icon">✅</div>No action items were extracted from the latest notes.</div>`;
+    renderActionItemsLog();
+    return;
+  }
+
+  el.innerHTML = renderMarkdown(content);
+  renderActionItemsLog();
+}
+
 async function generateNotes(){
   if(!sessionId) return;
   const method=document.getElementById('noteMethod').value;
@@ -1352,7 +1497,13 @@ async function generateNotes(){
     const r=await fetch(`/api/sessions/${sessionId}/notes/generate`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({method})});
     const d=await r.json();
     if(d.error) document.getElementById('notesContent').textContent='Error: '+d.error;
-    else document.getElementById('notesContent').innerHTML=renderMarkdown(d.content);
+    else {
+      currentNoteContent = d.content || '';
+      currentActionItemsContent = d.action_items || '';
+      currentActionItemsLog = parseStoredJson(d.action_items_log, null);
+      document.getElementById('notesContent').innerHTML=renderMarkdown(currentNoteContent);
+      renderActionItems();
+    }
   }catch(e){document.getElementById('notesContent').textContent='Error: '+e.message;}
 }
 

@@ -21,7 +21,7 @@ import { createTranscriber } from './transcriber.js';
 import {
   generateRollingSummary, detectTopicChange, answerQuestion,
   generateSessionTitle, generateNotes, getNoteMethods, analyzeScreenCapture,
-  detectConceptBoundary, generateConceptRecap
+  detectConceptBoundary, generateConceptRecap, extractActionItems
 } from './summarizer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,6 +42,26 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 await initDB();
 
 const activeSessions = new Map();
+
+
+function logActionItemsExtraction(sessionId, sessionMode, actionItemsMarkdown, actionItemsLog) {
+  const itemCount = actionItemsMarkdown && !/^\s*-\s+None identified\s*$/im.test(actionItemsMarkdown)
+    ? actionItemsMarkdown.split(/\n/).filter(line => /^-\s+(?:\[ \]\s+)?/.test(line)).length
+    : 0;
+
+  console.log(`[ActionItems][${sessionId}][${sessionMode}] ${itemCount} item(s) extracted.`);
+  if (actionItemsLog?.summary) {
+    console.log(`[ActionItems][${sessionId}] Summary: ${actionItemsLog.summary}`);
+  }
+
+  (actionItemsLog?.included || []).forEach((entry, idx) => {
+    console.log(`[ActionItems][${sessionId}][included ${idx + 1}] ${entry.timestamp || 'n/a'} | ${entry.candidate || ''} | ${entry.reason || ''}`);
+  });
+
+  (actionItemsLog?.excluded || []).forEach((entry, idx) => {
+    console.log(`[ActionItems][${sessionId}][excluded ${idx + 1}] ${entry.timestamp || 'n/a'} | ${entry.candidate || ''} | ${entry.reason || ''}`);
+  });
+}
 
 // ══════════════ Folder API ══════════════
 app.get('/api/folders', (req, res) => res.json(listFolders()));
@@ -272,9 +292,19 @@ app.post('/api/sessions/:id/notes/generate', async (req, res) => {
     const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sid) : {};
     const screenCaptures = getScreenCaptures(sid);
     const content = await generateNotes(GEMINI_KEY, chunks, summaries, method, speakerNameMap, screenCaptures);
+    const actionItemsResult = await extractActionItems(GEMINI_KEY, chunks, sessionMode, speakerNameMap, screenCaptures);
+    const actionItemsLogText = JSON.stringify(actionItemsResult.log, null, 2);
+    logActionItemsExtraction(sid, sessionMode, actionItemsResult.actionItemsMarkdown, actionItemsResult.log);
     const noteId = uuid();
-    upsertNote(noteId, sid, method, content);
-    res.json({ id: noteId, session_id: sid, method, content });
+    upsertNote(noteId, sid, method, content, actionItemsResult.actionItemsMarkdown, actionItemsLogText);
+    res.json({
+      id: noteId,
+      session_id: sid,
+      method,
+      content,
+      action_items: actionItemsResult.actionItemsMarkdown,
+      action_items_log: actionItemsResult.log,
+    });
   } catch (err) {
     console.error('[Notes]', err.message);
     res.status(500).json({ error: err.message });
@@ -544,10 +574,24 @@ function stopSession(sessionId) {
       const defaultMethod = sessionMode === 'meeting' ? 'meeting' : 'cornell';
       const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sessionId) : {};
       const screenCaptures = getScreenCaptures(sessionId);
-      generateNotes(GEMINI_KEY, chunks, summaries, defaultMethod, speakerNameMap, screenCaptures).then(content => {
+      Promise.all([
+        generateNotes(GEMINI_KEY, chunks, summaries, defaultMethod, speakerNameMap, screenCaptures),
+        extractActionItems(GEMINI_KEY, chunks, sessionMode, speakerNameMap, screenCaptures),
+      ]).then(([content, actionItemsResult]) => {
         const noteId = uuid();
-        upsertNote(noteId, sessionId, defaultMethod, content);
-        broadcastToSession(sessionId, { type: 'notes_generated', data: { id: noteId, method: defaultMethod, content } });
+        const actionItemsLogText = JSON.stringify(actionItemsResult.log, null, 2);
+        logActionItemsExtraction(sessionId, sessionMode, actionItemsResult.actionItemsMarkdown, actionItemsResult.log);
+        upsertNote(noteId, sessionId, defaultMethod, content, actionItemsResult.actionItemsMarkdown, actionItemsLogText);
+        broadcastToSession(sessionId, {
+          type: 'notes_generated',
+          data: {
+            id: noteId,
+            method: defaultMethod,
+            content,
+            action_items: actionItemsResult.actionItemsMarkdown,
+            action_items_log: actionItemsResult.log,
+          }
+        });
       }).catch(e => console.error('[AutoNotes]', e.message));
     }
   }
