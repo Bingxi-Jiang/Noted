@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SCRIBE</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="/google-drive-config.js"></script>
 <style>
 :root {
   --bg: #09090e;
@@ -444,6 +446,10 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
 .concept-card-body h3 { font-size:13px; color:var(--text); margin:6px 0 3px; }
 .concept-card-body strong { color:var(--text); }
 
+/* ── Export format card selected ── */
+.mode-card.selected { border-color:var(--accent); background:var(--accent-dim); }
+.mode-card.selected .mc-title, .mode-card.selected div[style*="font-weight:600"] { color:var(--accent); }
+
 .screen-preview-strip {
   display:none; padding:6px 16px; background:var(--surface);
   border-bottom:1px solid var(--border); align-items:center; gap:10px;
@@ -588,6 +594,7 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
           <h3>Notes</h3>
           <select class="notes-method-select" id="noteMethod"></select>
           <button class="btn" onclick="generateNotes()" style="font-size:10px">Generate</button>
+          <button class="btn" id="btnExport" onclick="showExportModal()" style="font-size:10px" title="Export notes">⬇ Export</button>
         </div>
         <div class="notes-content" id="notesContent">
           <div class="empty-msg">
@@ -646,6 +653,60 @@ body { background:var(--bg); color:var(--text); font-family:var(--sans); height:
     <div class="modal-actions" style="margin-top:12px">
       <button class="btn" onclick="closeSpeakerModal()">Close</button>
       <button class="btn primary" onclick="saveSpeakerNames()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Export Modal -->
+<div class="modal-overlay hidden" id="exportModal">
+  <div class="modal" style="min-width:400px">
+    <h3>⬇ Export Notes</h3>
+
+    <!-- Step 1: Format -->
+    <div id="exportStep1">
+      <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px">Choose a file format:</p>
+      <div style="display:flex;gap:10px;margin-bottom:14px">
+        <div class="mode-card" id="expOptPdf" onclick="selectExportFormat('pdf')" style="flex:1;padding:16px;text-align:center">
+          <div style="font-size:28px;margin-bottom:6px">📄</div>
+          <div style="font-size:14px;font-weight:600">PDF</div>
+          <div style="font-size:11px;color:var(--text-muted)">Best for sharing & printing</div>
+        </div>
+        <div class="mode-card" id="expOptDocx" onclick="selectExportFormat('docx')" style="flex:1;padding:16px;text-align:center">
+          <div style="font-size:28px;margin-bottom:6px">📝</div>
+          <div style="font-size:14px;font-weight:600">Word</div>
+          <div style="font-size:11px;color:var(--text-muted)">Best for editing (.docx)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 2: Destination -->
+    <div id="exportStep2" style="display:none">
+      <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px">
+        Export as <strong id="exportFormatLabel">PDF</strong> — choose destination:
+      </p>
+      <div style="display:flex;gap:10px;margin-bottom:14px">
+        <div class="mode-card" onclick="doExportLocal()" style="flex:1;padding:16px;text-align:center;cursor:pointer">
+          <div style="font-size:28px;margin-bottom:6px">💾</div>
+          <div style="font-size:14px;font-weight:600">Save to Computer</div>
+          <div style="font-size:11px;color:var(--text-muted)">Download to your device</div>
+        </div>
+        <div class="mode-card" onclick="doExportGDrive()" style="flex:1;padding:16px;text-align:center;cursor:pointer">
+          <div style="font-size:28px;margin-bottom:6px">☁️</div>
+          <div style="font-size:14px;font-weight:600">Google Drive</div>
+          <div style="font-size:11px;color:var(--text-muted)">Upload to your Drive</div>
+        </div>
+      </div>
+      <button class="btn" onclick="exportGoBack()" style="font-size:11px">← Back</button>
+    </div>
+
+    <!-- Step 3: Progress/Done -->
+    <div id="exportStep3" style="display:none;text-align:center;padding:20px 0">
+      <span class="spinner" id="exportSpinner" style="width:20px;height:20px"></span>
+      <p style="margin-top:10px;font-size:13px;color:var(--text-dim)" id="exportStatus">Generating file…</p>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn" onclick="closeExportModal()">Close</button>
     </div>
   </div>
 </div>
@@ -1293,6 +1354,226 @@ async function generateNotes(){
     if(d.error) document.getElementById('notesContent').textContent='Error: '+d.error;
     else document.getElementById('notesContent').innerHTML=renderMarkdown(d.content);
   }catch(e){document.getElementById('notesContent').textContent='Error: '+e.message;}
+}
+
+// ══════════════════════════════════════════════════════
+//  Export
+// ══════════════════════════════════════════════════════
+let exportFormat = 'pdf'; // 'pdf' or 'docx'
+const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+let googleDriveTokenClient = null;
+let googleDriveAccessToken = null;
+let googleDriveTokenExpiresAt = 0;
+
+function showExportModal() {
+  if (!sessionId) return;
+  // Reset to step 1
+  document.getElementById('exportStep1').style.display = '';
+  document.getElementById('exportStep2').style.display = 'none';
+  document.getElementById('exportStep3').style.display = 'none';
+  document.getElementById('expOptPdf').classList.remove('selected');
+  document.getElementById('expOptDocx').classList.remove('selected');
+  exportFormat = 'pdf';
+  document.getElementById('exportModal').classList.remove('hidden');
+}
+
+function closeExportModal() {
+  document.getElementById('exportModal').classList.add('hidden');
+}
+
+function selectExportFormat(fmt) {
+  exportFormat = fmt;
+  document.getElementById('expOptPdf').classList.toggle('selected', fmt === 'pdf');
+  document.getElementById('expOptDocx').classList.toggle('selected', fmt === 'docx');
+  document.getElementById('exportFormatLabel').textContent = fmt === 'pdf' ? 'PDF' : 'Word (.docx)';
+  // Move to step 2
+  document.getElementById('exportStep1').style.display = 'none';
+  document.getElementById('exportStep2').style.display = '';
+}
+
+function exportGoBack() {
+  document.getElementById('exportStep1').style.display = '';
+  document.getElementById('exportStep2').style.display = 'none';
+}
+
+function getExportFileName() {
+  const ext = exportFormat === 'docx' ? 'docx' : 'pdf';
+  const rawTitle = document.getElementById('topTitle').textContent || 'notes';
+  const safeTitle = rawTitle.replace(/[\\/:*?"<>|]+/g, '').trim() || 'notes';
+  return `${safeTitle}.${ext}`;
+}
+
+async function fetchExportBlob() {
+  const res = await fetch(`/api/sessions/${sessionId}/export/${exportFormat}`);
+  if (!res.ok) {
+    let err = null;
+    try { err = await res.json(); } catch {}
+    throw new Error(err?.error || 'Export failed');
+  }
+  return res.blob();
+}
+
+async function doExportLocal() {
+  document.getElementById('exportStep2').style.display = 'none';
+  document.getElementById('exportStep3').style.display = '';
+  document.getElementById('exportStatus').textContent = `Generating ${exportFormat.toUpperCase()} file…`;
+  document.getElementById('exportSpinner').style.display = '';
+  try {
+    const blob = await fetchExportBlob();
+    const fileName = getExportFileName();
+    downloadBlob(blob, fileName);
+    document.getElementById('exportSpinner').style.display = 'none';
+    document.getElementById('exportStatus').innerHTML = `✅ Downloaded! <strong>${esc(fileName)}</strong>`;
+  } catch (e) {
+    document.getElementById('exportSpinner').style.display = 'none';
+    document.getElementById('exportStatus').textContent = '❌ ' + e.message;
+  }
+}
+
+async function doExportGDrive() {
+  document.getElementById('exportStep2').style.display = 'none';
+  document.getElementById('exportStep3').style.display = '';
+  document.getElementById('exportSpinner').style.display = '';
+  document.getElementById('exportStatus').textContent = `Generating ${exportFormat.toUpperCase()} file…`;
+
+  try {
+    const blob = await fetchExportBlob();
+    const fileName = getExportFileName();
+
+    document.getElementById('exportStatus').textContent = 'Connecting to Google Drive…';
+    const accessToken = await ensureGoogleDriveAccessToken();
+
+    document.getElementById('exportStatus').textContent = 'Uploading to Google Drive…';
+    const uploaded = await uploadBlobToGoogleDrive(blob, fileName, accessToken);
+
+    document.getElementById('exportSpinner').style.display = 'none';
+    const openLink = uploaded.webViewLink
+      ? `<a href="${uploaded.webViewLink}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">Open file in Google Drive ↗</a>`
+      : '';
+    document.getElementById('exportStatus').innerHTML = `✅ Uploaded to Google Drive as <strong>${esc(uploaded.name || fileName)}</strong>${openLink ? `<br><br>${openLink}` : ''}`;
+  } catch (e) {
+    document.getElementById('exportSpinner').style.display = 'none';
+    document.getElementById('exportStatus').textContent = '❌ ' + e.message;
+  }
+}
+
+function downloadBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function getGoogleDriveClientId() {
+  return (window.SCRIBE_CONFIG && window.SCRIBE_CONFIG.googleDriveClientId) || '';
+}
+
+function assertGoogleDriveConfigured() {
+  const clientId = getGoogleDriveClientId();
+  if (!clientId || clientId.includes('YOUR_GOOGLE_OAUTH_WEB_CLIENT_ID')) {
+    throw new Error("Google Drive OAuth is not configured yet. Add your product's Google OAuth Web Client ID in public/google-drive-config.js. End users do not need to enter anything.");
+  }
+  return clientId;
+}
+
+function waitForGoogleIdentity(timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (window.google?.accounts?.oauth2) {
+        clearInterval(timer);
+        resolve();
+        return;
+      }
+      if (Date.now() - startedAt > timeoutMs) {
+        clearInterval(timer);
+        reject(new Error('Google Sign-In failed to load. Check network or browser privacy settings and try again.'));
+      }
+    }, 80);
+  });
+}
+
+async function getGoogleDriveTokenClient() {
+  if (googleDriveTokenClient) return googleDriveTokenClient;
+  const clientId = assertGoogleDriveConfigured();
+  await waitForGoogleIdentity();
+  googleDriveTokenClient = window.google.accounts.oauth2.initTokenClient({
+    client_id: clientId,
+    scope: GOOGLE_DRIVE_SCOPE,
+    callback: () => {},
+    error_callback: (err) => {
+      console.error('[Google Drive OAuth]', err);
+    },
+  });
+  return googleDriveTokenClient;
+}
+
+async function ensureGoogleDriveAccessToken(forcePrompt = false) {
+  if (!forcePrompt && googleDriveAccessToken && Date.now() < googleDriveTokenExpiresAt - 60_000) {
+    return googleDriveAccessToken;
+  }
+
+  const tokenClient = await getGoogleDriveTokenClient();
+  return new Promise((resolve, reject) => {
+    tokenClient.callback = (response) => {
+      if (!response || response.error) {
+        reject(new Error(response?.error_description || response?.error || 'Google authorization was not completed.'));
+        return;
+      }
+      googleDriveAccessToken = response.access_token;
+      googleDriveTokenExpiresAt = Date.now() + ((response.expires_in || 3600) * 1000);
+      resolve(googleDriveAccessToken);
+    };
+
+    try {
+      tokenClient.requestAccessToken({
+        prompt: forcePrompt || !googleDriveAccessToken ? 'consent' : '',
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function uploadBlobToGoogleDrive(blob, fileName, accessToken, isRetry = false) {
+  const metadata = {
+    name: fileName,
+    mimeType: blob.type || (exportFormat === 'docx'
+      ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      : 'application/pdf'),
+  };
+
+  const form = new FormData();
+  form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+  form.append('file', blob, fileName);
+
+  const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,webContentLink', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: form,
+  });
+
+  if ((res.status === 401 || res.status === 403) && !isRetry) {
+    const refreshedToken = await ensureGoogleDriveAccessToken(true);
+    return uploadBlobToGoogleDrive(blob, fileName, refreshedToken, true);
+  }
+
+  if (!res.ok) {
+    let details = '';
+    try {
+      const payload = await res.json();
+      details = payload?.error?.message || payload?.error_description || '';
+    } catch {}
+    throw new Error(details || 'Google Drive upload failed.');
+  }
+
+  return res.json();
 }
 
 function updateSettings(){

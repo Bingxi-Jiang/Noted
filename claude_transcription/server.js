@@ -286,6 +286,44 @@ app.put('/api/notes/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// ══════════════ Export API ══════════════
+app.get('/api/sessions/:id/export/:format', async (req, res) => {
+  try {
+    const sid = req.params.id;
+    const format = req.params.format; // 'docx' or 'pdf'
+    const session = getSession(sid);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    const note = getNote(sid);
+    if (!note) return res.status(400).json({ error: 'No notes to export. Generate notes first.' });
+
+    const title = session.title || 'Untitled Session';
+    const safeTitle = title.replace(/[^a-zA-Z0-9\u4e00-\u9fff\s_-]/g, '').trim() || 'notes';
+    const sessionInfo = {
+      date: new Date(session.created_at).toLocaleString(),
+      mode: session.mode === 'meeting' ? 'Meeting' : 'Lecture',
+    };
+
+    if (format === 'docx') {
+      const { generateDocx } = await import('./exporter.js');
+      const buffer = await generateDocx(title, note.content, sessionInfo);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}.docx"`);
+      res.send(buffer);
+    } else if (format === 'pdf') {
+      const { generatePdf } = await import('./exporter.js');
+      const buffer = await generatePdf(title, note.content, sessionInfo);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeTitle)}.pdf"`);
+      res.send(buffer);
+    } else {
+      res.status(400).json({ error: 'Unsupported format. Use docx or pdf.' });
+    }
+  } catch (err) {
+    console.error('[Export]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ══════════════ Auto-title ══════════════
 app.post('/api/sessions/:id/auto-title', async (req, res) => {
   if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
