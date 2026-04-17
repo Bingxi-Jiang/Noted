@@ -13,6 +13,7 @@ const state = {
   currentNote: null,
   speakerMap: {},
   screenCaptures: [],
+  expandedScreenCaptures: {},
   activeTab: 'notes',
   partialTranscript: null,
   micEnabled: false,
@@ -82,6 +83,7 @@ function scheduleRender() {
 }
 
 function render() {
+  syncDerivedProgressStates();
   const focusState = captureFocusState();
   const transcriptScrollBefore = app.querySelector('[data-transcript-scroll]');
   const shouldStickTranscriptToBottom = transcriptScrollBefore
@@ -92,7 +94,7 @@ function render() {
     <div class="app-shell">
       ${renderSidebar()}
       <main class="main">
-        ${!state.sidebarOpen ? '<div style="position:fixed;top:18px;left:18px;z-index:30;"><button class="icon-btn" data-action="toggle-sidebar" title="展开侧边栏">☰</button></div>' : ''}
+        ${!state.sidebarOpen ? '<div class="sidebar-peek-btn"><button class="icon-btn" data-action="toggle-sidebar" title="展开侧边栏">☰</button></div>' : ''}
         ${state.view === 'home' ? renderHome() : renderWorkspace()}
       </main>
       ${state.showExportModal ? renderExportModal() : ''}
@@ -194,10 +196,10 @@ function renderSessionItem(session) {
   const meta = `${formatDate(session.created_at)} · ${session.mode}`;
   const fullTitle = session.title || 'Untitled Session';
   return `
-    <button class="list-item ${active ? 'active' : ''}" data-action="open-session" data-session-id="${session.id}" title="${escapeAttr(fullTitle)}">
+    <button class="list-item session-item ${active ? 'active' : ''}" data-action="open-session" data-session-id="${session.id}" title="${escapeAttr(fullTitle)}">
       <span class="session-icon">${icon}</span>
       <div class="list-copy">
-        <div class="list-title">${escapeHtml(compactTitle(fullTitle, 32))}</div>
+        <div class="list-title">${escapeHtml(compactTitle(fullTitle, 24))}</div>
         <div class="list-meta">${escapeHtml(meta)}</div>
       </div>
     </button>
@@ -354,15 +356,25 @@ function renderTranscriptBody() {
     `;
   }
 
-  const lines = state.currentTranscript.map((line) => {
+  const lines = state.currentTranscript.map((line, idx) => {
     if (line.type === 'screen_capture') {
+      const captureId = String(line.id || `screen_${line.capture_time || line.start_time || idx}`);
+      const expanded = Boolean(state.expandedScreenCaptures[captureId]);
+      const rawDesc = String(line.description || line.text || '').replace(/\s+/g, ' ').trim();
+      const rawOcr = String(line.extracted_text || '').replace(/\s+/g, ' ').trim();
+      const shortDesc = compactVisualContext(rawDesc, 58);
+      const shortOcr = compactVisualContext(rawOcr, 72);
+      const canExpand = rawDesc.length > shortDesc.length || rawOcr.length > shortOcr.length;
       return `
-        <div class="screen-card">
+        <div class="screen-card ${expanded ? 'expanded' : ''}">
           <div class="transcript-time">${formatDuration(line.capture_time || line.start_time || 0)}</div>
           <div class="screen-card-inner">
-            <div class="screen-card-title">视觉上下文抓取</div>
-            <div class="transcript-text">${escapeHtml(line.description || line.text || '')}</div>
-            ${line.extracted_text ? `<div class="muted" style="margin-top:8px;font-size:13px;">OCR / 提取文本：${escapeHtml(line.extracted_text)}</div>` : ''}
+            <div class="screen-card-head">
+              <div class="screen-card-title">视觉上下文</div>
+              ${canExpand ? `<button class="screen-readmore" data-action="toggle-screen-capture" data-capture-id="${escapeAttr(captureId)}">${expanded ? '收起' : 'Read more'}</button>` : ''}
+            </div>
+            <div class="screen-card-text ${expanded ? 'expanded' : 'collapsed'}">${escapeHtml(expanded ? rawDesc : shortDesc)}</div>
+            ${rawOcr ? `<div class="screen-card-subline">OCR：${escapeHtml(expanded ? rawOcr : shortOcr)}</div>` : ''}
           </div>
         </div>
       `;
@@ -425,9 +437,7 @@ function renderNotesTab() {
             <div class="muted" style="font-size:13px;margin-top:4px;">可以在生成前切换笔记方式。</div>
           </div>
           <div class="note-toolbar-actions">
-            <select class="select-input note-method-select" data-model="selectedNoteMethod">
-              ${methodOptions}
-            </select>
+            ${renderNoteMethodPicker(methodOptions)}
             <button class="primary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>生成 AI 笔记</button>
           </div>
         </div>
@@ -448,9 +458,7 @@ function renderNotesTab() {
           <div class="muted" style="font-size:13px;margin-top:4px;">当前方法：${escapeHtml(getNoteMethodLabel(state.currentNote.method || state.selectedNoteMethod || 'default'))}</div>
         </div>
         <div class="note-toolbar-actions">
-          <select class="select-input note-method-select" data-model="selectedNoteMethod">
-            ${methodOptions}
-          </select>
+          ${renderNoteMethodPicker(methodOptions)}
           <button class="secondary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>重新生成</button>
         </div>
       </div>
@@ -459,10 +467,22 @@ function renderNotesTab() {
   `;
 }
 
+function renderNoteMethodPicker(methodOptions) {
+  return `
+    <label class="select-shell note-method-shell">
+      <span class="select-prefix">Style</span>
+      <select class="select-input note-method-select" data-model="selectedNoteMethod">
+        ${methodOptions}
+      </select>
+      <span class="select-chevron">⌄</span>
+    </label>
+  `;
+}
+
 function renderActionItemsTab() {
   const progress = renderProgressPanel('action_items', 'Action Items 提取状态');
 
-  if (!state.currentNote?.action_items) {
+  if (!state.currentNote || !Object.prototype.hasOwnProperty.call(state.currentNote, 'action_items')) {
     return `
       ${progress}
       <div class="note-body">
@@ -476,8 +496,6 @@ function renderActionItemsTab() {
   }
 
   const items = parseActionItems(state.currentNote.action_items);
-  const log = parseActionLog(state.currentNote.action_items_log);
-  const visibleLog = hasVisibleActionLog(log);
 
   return `
     ${progress}
@@ -489,7 +507,6 @@ function renderActionItemsTab() {
       <div class="action-list">
         ${items.length ? items.map(renderActionItem).join('') : `<div class="muted">没有识别出明确 action item。</div>`}
       </div>
-      ${visibleLog ? `<div class="log-box">${escapeHtml(formatActionLog(log))}</div>` : ''}
     </div>
   `;
 }
@@ -735,6 +752,10 @@ async function handleClick(event) {
         state.activeTab = actionEl.dataset.tab;
         scheduleRender();
         break;
+      case 'toggle-screen-capture':
+        state.expandedScreenCaptures[actionEl.dataset.captureId || ''] = !state.expandedScreenCaptures[actionEl.dataset.captureId || ''];
+        scheduleRender();
+        break;
       case 'generate-notes':
         await generateNotes();
         break;
@@ -896,6 +917,7 @@ async function openSession(sessionId, options = {}) {
   state.currentNote = note || null;
   state.speakerMap = speakers || {};
   state.screenCaptures = screenCaptures || [];
+  state.expandedScreenCaptures = {};
   state.noteMethods = noteMethods || [];
   state.selectedNoteMethod = note?.method || getDefaultNoteMethod(session?.mode, noteMethods);
   state.qaMessages = [];
@@ -917,6 +939,7 @@ async function leaveSession() {
   state.currentNote = null;
   state.speakerMap = {};
   state.screenCaptures = [];
+  state.expandedScreenCaptures = {};
   state.partialTranscript = null;
   state.qaMessages = [];
   state.qaInput = '';
@@ -1350,6 +1373,7 @@ async function refreshSessionData(sessionId) {
   state.currentNote = note || state.currentNote;
   state.speakerMap = speakers || {};
   state.screenCaptures = screenCaptures || [];
+  state.expandedScreenCaptures = {};
   scheduleRender();
 }
 
@@ -1720,11 +1744,93 @@ function markdownToHtml(markdown = '') {
   return htmlBlocks.join('');
 }
 
-function inlineMarkdown(text = '') {
-  return text
+function compactVisualContext(text = '', max = 64) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!value) return '';
+  return value.length > max ? `${value.slice(0, Math.max(10, max - 1))}…` : value;
+}
+
+function renderMathAwareText(text = '') {
+  const placeholders = [];
+  let working = String(text || '');
+  working = working.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => {
+    const token = `%%MATH${placeholders.length}%%`;
+    placeholders.push(`<span class="math-block">${latexToReadableMath(expr)}</span>`);
+    return token;
+  });
+  working = working.replace(/(^|[^\\])\$([^$\n]+?)\$/g, (_, prefix, expr) => {
+    const token = `%%MATH${placeholders.length}%%`;
+    placeholders.push(`<span class="math-inline">${latexToReadableMath(expr)}</span>`);
+    return `${prefix}${token}`;
+  });
+
+  working = working
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
     .replace(/`(.+?)`/g, '<code>$1</code>');
+
+  return working.replace(/%%MATH(\d+)%%/g, (_, index) => placeholders[Number(index)] || '');
+}
+
+function latexToReadableMath(expr = '') {
+  let value = String(expr || '').trim();
+  const greek = {
+    alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', theta: 'θ', lambda: 'λ', mu: 'μ',
+    pi: 'π', sigma: 'σ', phi: 'φ', omega: 'ω', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ',
+    Pi: 'Π', Sigma: 'Σ', Phi: 'Φ', Omega: 'Ω'
+  };
+  const supers = {
+    '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+    '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ'
+  };
+  const subs = {
+    '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉',
+    '+': '₊', '-': '₋', '=': '₌', '(': '₍', ')': '₎', 'a': 'ₐ', 'e': 'ₑ', 'h': 'ₕ', 'i': 'ᵢ', 'j': 'ⱼ',
+    'k': 'ₖ', 'l': 'ₗ', 'm': 'ₘ', 'n': 'ₙ', 'o': 'ₒ', 'p': 'ₚ', 'r': 'ᵣ', 's': 'ₛ', 't': 'ₜ', 'u': 'ᵤ',
+    'v': 'ᵥ', 'x': 'ₓ'
+  };
+
+  const encodeScript = (input, table, fallbackPrefix) => {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    const converted = Array.from(raw).map((char) => table[char]).join('');
+    if (converted && Array.from(raw).every((char) => table[char])) return converted;
+    return `${fallbackPrefix}(${raw})`;
+  };
+
+  const replaceLoop = (pattern, replacer) => {
+    let prev = '';
+    while (prev !== value) {
+      prev = value;
+      value = value.replace(pattern, replacer);
+    }
+  };
+
+  replaceLoop(/\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g, (_, num, den) => `(${latexToReadableMath(num)}) ⁄ (${latexToReadableMath(den)})`);
+  replaceLoop(/\\sqrt\s*\{([^{}]+)\}/g, (_, inner) => `√(${latexToReadableMath(inner)})`);
+  value = value.replace(/\\operatorname\s*\{([^{}]+)\}/g, '$1');
+  value = value.replace(/\\text\s*\{([^{}]+)\}/g, '$1');
+  value = value.replace(/\\left|\\right/g, '');
+  value = value.replace(/\\cdot/g, '·').replace(/\\times/g, '×').replace(/\\div/g, '÷');
+  value = value.replace(/\\leq?/g, '≤').replace(/\\geq?/g, '≥').replace(/\\neq/g, '≠').replace(/\\approx/g, '≈');
+  value = value.replace(/\\to/g, '→').replace(/\\infty/g, '∞').replace(/\\pm/g, '±');
+  value = value.replace(/\\sum/g, 'Σ').replace(/\\prod/g, '∏').replace(/\\int/g, '∫');
+  Object.entries(greek).forEach(([name, char]) => {
+    value = value.replace(new RegExp(`\\\\${name}(?![A-Za-z])`, 'g'), char);
+  });
+  value = value.replace(/\^\{([^{}]+)\}/g, (_, inner) => encodeScript(latexToReadableMath(inner), supers, '^'));
+  value = value.replace(/_\{([^{}]+)\}/g, (_, inner) => encodeScript(latexToReadableMath(inner), subs, '_'));
+  value = value.replace(/\^([A-Za-z0-9+\-=()])/g, (_, inner) => encodeScript(inner, supers, '^'));
+  value = value.replace(/_([A-Za-z0-9+\-=()])/g, (_, inner) => encodeScript(inner, subs, '_'));
+  value = value.replace(/\\,/g, ' ').replace(/\\;/g, ' ');
+  value = value.replace(/[{}]/g, '');
+  value = value.replace(/\\/g, '');
+  value = value.replace(/\s+/g, ' ').trim();
+  return value;
+}
+
+function inlineMarkdown(text = '') {
+  return renderMathAwareText(text);
 }
 
 function captureFrameFromVideo(video) {
@@ -1892,6 +1998,47 @@ function resetAllProgress() {
   Object.keys(state.progress).forEach((key) => resetProgress(key));
 }
 
+function hasGeneratedContent(key) {
+  if (key === 'notes') return Boolean(state.currentNote);
+  if (key === 'action_items') return Boolean(state.currentNote && Object.prototype.hasOwnProperty.call(state.currentNote, 'action_items'));
+  if (key === 'recaps') return Boolean((state.currentSummaries || []).some((summary) => summary.summary_type === 'concept'));
+  if (key === 'qa') return Boolean((state.qaMessages || []).some((message) => message.role === 'assistant'));
+  return false;
+}
+
+function syncDerivedProgressStates() {
+  const defaults = {
+    notes: '等待生成',
+    action_items: '等待提取',
+    recaps: '等待总结',
+    qa: '等待提问',
+  };
+  const labels = {
+    notes: '已有已生成笔记',
+    action_items: '已有已提取待办',
+    recaps: '已有概念总结',
+    qa: '已有问答结果',
+  };
+
+  Object.keys(defaults).forEach((key) => {
+    const progress = state.progress[key];
+    if (!progress || progress.active) return;
+    const exists = hasGeneratedContent(key);
+    if (exists) {
+      clearInterval(progress.timer);
+      progress.timer = null;
+      progress.active = false;
+      progress.status = 'done';
+      progress.percent = 100;
+      progress.label = labels[key];
+    } else if (progress.status === 'done') {
+      progress.status = 'idle';
+      progress.percent = 0;
+      progress.label = defaults[key];
+    }
+  });
+}
+
 function renderProgressPanel(key, title) {
   const progress = state.progress[key];
   if (!progress || (progress.status === 'idle' && !progress.active)) {
@@ -1910,7 +2057,7 @@ function renderProgressPanel(key, title) {
     <div class="progress-panel ${progress.status === 'error' ? 'error' : progress.status === 'done' ? 'done' : ''}">
       <div class="progress-head">
         <div class="progress-title">${escapeHtml(title)}</div>
-        <div class="progress-status ${escapeHtml(progress.status)}">${progress.status === 'running' ? 'Working' : progress.status === 'done' ? 'Done' : progress.status === 'error' ? 'Error' : 'Ready'}</div>
+        <div class="progress-status ${escapeHtml(progress.status)}">${progress.status === 'running' ? 'Working' : progress.status === 'done' ? 'Complete' : progress.status === 'error' ? 'Error' : 'Ready'}</div>
       </div>
       <div class="progress-bar"><div class="progress-fill ${progress.active ? 'active' : ''}" style="width:${Math.max(0, Math.min(100, Math.round(progress.percent || 0)))}%"></div></div>
       <div class="progress-caption">${escapeHtml(progress.label || '')}${progress.percent ? ` · ${Math.round(progress.percent)}%` : ''}</div>

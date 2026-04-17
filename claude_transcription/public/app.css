@@ -46,13 +46,14 @@ input, textarea, select {
   width: 100%;
 }
 .sidebar {
-  width: 320px;
+  width: 312px;
   background: rgba(255,255,255,0.86);
   backdrop-filter: blur(16px);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   transition: width .25s ease;
+  overflow: hidden;
 }
 .sidebar.collapsed {
   width: 0;
@@ -99,7 +100,8 @@ input, textarea, select {
 .sidebar-content {
   flex: 1;
   overflow-y: auto;
-  padding: 20px 18px 28px;
+  overflow-x: hidden;
+  padding: 18px 16px 24px;
 }
 .sidebar-section {
   margin-bottom: 28px;
@@ -123,13 +125,16 @@ input, textarea, select {
 .list {
   display: grid;
   gap: 8px;
+  overflow-x: hidden;
 }
 .list-item {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border: 1px solid transparent;
   background: transparent;
   border-radius: 14px;
-  padding: 12px 13px;
+  padding: 11px 12px;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -144,6 +149,15 @@ input, textarea, select {
 .list-item.active {
   background: #eef4ff;
   border-color: #cfe0ff;
+}
+.session-item {
+  padding: 10px 11px;
+  border-radius: 12px;
+}
+.session-item.active {
+  background: #f4f8ff;
+  border-color: transparent;
+  box-shadow: inset 3px 0 0 var(--blue);
 }
 .list-item-dot {
   width: 10px;
@@ -179,12 +193,20 @@ input, textarea, select {
   font-size: 12px;
 }
 .sidebar-footer {
-  padding: 18px 20px;
+  padding: 16px 18px;
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
   gap: 12px;
   background: rgba(255,255,255,.92);
+  overflow: hidden;
+}
+
+.sidebar-peek-btn {
+  position: fixed;
+  left: 18px;
+  bottom: 18px;
+  z-index: 30;
 }
 .avatar {
   width: 40px;
@@ -665,12 +687,36 @@ input, textarea, select {
   background: #eff5ff;
   border: 1px solid #dce7ff;
   border-radius: 18px;
-  padding: 16px;
+  padding: 14px 15px;
+}
+.screen-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
 }
 .screen-card-title {
   font-weight: 700;
   color: #1f5bff;
-  margin-bottom: 6px;
+  margin-bottom: 0;
+  font-size: 13px;
+}
+.screen-card-text {
+  line-height: 1.6;
+  color: #1f2937;
+}
+.screen-card-subline {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #526581;
+  line-height: 1.55;
+}
+.screen-readmore {
+  flex: 0 0 auto;
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 700;
 }
 .tab-row {
   display: flex;
@@ -733,8 +779,40 @@ input, textarea, select {
   flex-wrap: wrap;
 }
 .note-method-select {
-  min-width: 190px;
-  background: #fff;
+  min-width: 168px;
+  background: transparent;
+  border: none;
+  padding: 0 28px 0 0;
+  color: #0f172a;
+  font-weight: 700;
+  appearance: none;
+}
+.select-shell {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid #d7e2ff;
+  background: linear-gradient(180deg, #fbfdff, #f2f7ff);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.9);
+}
+.select-prefix {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: #5b6b83;
+}
+.select-chevron {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #5b6b83;
+  pointer-events: none;
+  font-size: 12px;
 }
 .progress-panel {
   margin-bottom: 16px;
@@ -1104,6 +1182,26 @@ input, textarea, select {
   border-radius: 16px;
   padding: 12px 14px;
   background: white;
+}
+.note-method-shell .select-input {
+  width: auto;
+}
+.math-inline,
+.math-block {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.12rem 0.42rem;
+  border-radius: 10px;
+  background: #f4f7ff;
+  border: 1px solid #dbe5ff;
+  font-family: "Cambria Math", "STIX Two Math", "Times New Roman", serif;
+  color: #173ea6;
+}
+.math-block {
+  display: flex;
+  width: fit-content;
+  margin: 8px 0;
+  padding: 0.4rem 0.65rem;
 }
 .speaker-row {
   display: flex;

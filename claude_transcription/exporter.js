@@ -62,11 +62,63 @@ function stripMarkdownInline(text) {
     .replace(/\*(.+?)\*/g, '$1');
 }
 
+function latexToReadableMath(expr = '') {
+  let value = String(expr || '').trim();
+  const greek = {
+    alpha: 'alpha', beta: 'beta', gamma: 'gamma', delta: 'delta', epsilon: 'epsilon', theta: 'theta', lambda: 'lambda', mu: 'mu',
+    pi: 'pi', sigma: 'sigma', phi: 'phi', omega: 'omega', Delta: 'Delta', Theta: 'Theta', Lambda: 'Lambda',
+    Pi: 'Pi', Sigma: 'Sigma', Phi: 'Phi', Omega: 'Omega'
+  };
+  const encodeScript = (input, fallbackPrefix) => {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    return `${fallbackPrefix}(${raw})`;
+  };
+
+  const replaceLoop = (pattern, replacer) => {
+    let prev = '';
+    while (prev !== value) {
+      prev = value;
+      value = value.replace(pattern, replacer);
+    }
+  };
+
+  replaceLoop(/\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g, (_, num, den) => `(${latexToReadableMath(num)})/(${latexToReadableMath(den)})`);
+  replaceLoop(/\\sqrt\s*\{([^{}]+)\}/g, (_, inner) => `sqrt(${latexToReadableMath(inner)})`);
+  value = value.replace(/\\operatorname\s*\{([^{}]+)\}/g, '$1');
+  value = value.replace(/\\text\s*\{([^{}]+)\}/g, '$1');
+  value = value.replace(/\\left|\\right/g, '');
+  value = value.replace(/\\cdot/g, '*').replace(/\\times/g, 'x').replace(/\\div/g, '/');
+  value = value.replace(/\\leq?/g, '<=').replace(/\\geq?/g, '>=').replace(/\\neq/g, '!=').replace(/\\approx/g, '~');
+  value = value.replace(/\\to/g, '->').replace(/\\infty/g, 'infinity').replace(/\\pm/g, '+/-');
+  value = value.replace(/\\sum/g, 'sum').replace(/\\prod/g, 'prod').replace(/\\int/g, 'int');
+  Object.entries(greek).forEach(([name, char]) => {
+    value = value.replace(new RegExp(`\\\\${name}(?![A-Za-z])`, 'g'), char);
+  });
+  value = value.replace(/\^\{([^{}]+)\}/g, (_, inner) => encodeScript(latexToReadableMath(inner), '^'));
+  value = value.replace(/_\{([^{}]+)\}/g, (_, inner) => encodeScript(latexToReadableMath(inner), '_'));
+  value = value.replace(/\^([A-Za-z0-9+\-=()])/g, (_, inner) => encodeScript(inner, '^'));
+  value = value.replace(/_([A-Za-z0-9+\-=()])/g, (_, inner) => encodeScript(inner, '_'));
+  value = value.replace(/\\,/g, ' ').replace(/\\;/g, ' ');
+  value = value.replace(/[{}]/g, '');
+  value = value.replace(/\\/g, '');
+  value = value.replace(/\s+/g, ' ').trim();
+  return value;
+}
+
+function normalizeMarkdownForExport(markdown = '') {
+  let value = String(markdown || '');
+  value = value.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => `\n${latexToReadableMath(expr)}\n`);
+  value = value.replace(/(^|[^\\])\$([^$\n]+?)\$/g, (_, prefix, expr) => `${prefix}${latexToReadableMath(expr)}`);
+  return value;
+}
+
 // ══════════════════════════════════════════════════════
 //  DOCX Generation
 // ══════════════════════════════════════════════════════
 export async function generateDocx(title, markdownContent, sessionInfo = {}) {
-  const blocks = parseMarkdown(markdownContent);
+  const normalizedContent = normalizeMarkdownForExport(markdownContent);
+  const blocks = parseMarkdown(normalizedContent);
   const children = [];
 
   // Title
@@ -187,6 +239,7 @@ export async function generateDocx(title, markdownContent, sessionInfo = {}) {
 //  PDF Generation
 // ══════════════════════════════════════════════════════
 export async function generatePdf(title, markdownContent, sessionInfo = {}) {
+  const normalizedContent = normalizeMarkdownForExport(markdownContent);
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({
       size: 'LETTER',
@@ -221,7 +274,7 @@ export async function generatePdf(title, markdownContent, sessionInfo = {}) {
       .moveTo(doc.page.margins.left, doc.y).lineTo(doc.page.margins.left + pageWidth, doc.y).stroke();
     doc.moveDown(0.5);
 
-    const blocks = parseMarkdown(markdownContent);
+    const blocks = parseMarkdown(normalizedContent);
 
     for (const block of blocks) {
       switch (block.type) {
