@@ -28,9 +28,20 @@ const state = {
   qaMessages: [],
   qaInput: '',
   loadingSession: false,
+  transcriptExpanded: false,
   generatingNotes: false,
   askingQuestion: false,
   creatingFolder: false,
+  showFolderModal: false,
+  folderDraft: { name: '', color: '#2962ff' },
+  selectionMode: false,
+  selectedSessionIds: [],
+  sessionContextMenu: { visible: false, sessionId: '', x: 0, y: 0 },
+  showMoveModal: false,
+  moveTargetFolderId: '',
+  moveSessionIds: [],
+  dragOverFolderId: '',
+  draggingSessionId: '',
   toast: null,
   progress: {
     notes: createProgressState('等待生成'),
@@ -39,6 +50,14 @@ const state = {
     qa: createProgressState('等待提问'),
   },
   recording: {
+    sessionId: '',
+    sessionMode: 'lecture',
+    sessionTitle: '',
+    liveTranscript: [],
+    liveSummaries: [],
+    liveScreenCaptures: [],
+    liveSpeakerMap: {},
+    partialTranscript: null,
     ws: null,
     displayStream: null,
     micStream: null,
@@ -56,6 +75,8 @@ const state = {
 const titleSaveTimers = new Map();
 let renderScheduled = false;
 let toastTimer = null;
+let latestOpenSessionToken = 0;
+const TRANSCRIPT_PREVIEW_LIMIT = 320;
 
 boot();
 
@@ -70,6 +91,12 @@ function attachGlobalHandlers() {
   app.addEventListener('input', handleInput);
   app.addEventListener('change', handleChange);
   app.addEventListener('submit', handleSubmit);
+  app.addEventListener('contextmenu', handleContextMenu);
+  app.addEventListener('dragstart', handleDragStart);
+  app.addEventListener('dragend', handleDragEnd);
+  app.addEventListener('dragover', handleDragOver);
+  app.addEventListener('drop', handleDrop);
+  window.addEventListener('keydown', handleKeyDown);
   window.addEventListener('beforeunload', cleanupAllMedia);
 }
 
@@ -95,15 +122,20 @@ function render() {
       ${renderSidebar()}
       <main class="main">
         ${!state.sidebarOpen ? '<div class="sidebar-peek-btn"><button class="icon-btn" data-action="toggle-sidebar" title="展开侧边栏">☰</button></div>' : ''}
+        ${renderBackgroundRecordingBanner()}
         ${state.view === 'home' ? renderHome() : renderWorkspace()}
       </main>
       ${state.showExportModal ? renderExportModal() : ''}
       ${state.showSpeakerModal ? renderSpeakerModal() : ''}
+      ${state.showFolderModal ? renderFolderModal() : ''}
+      ${state.showMoveModal ? renderMoveModal() : ''}
+      ${state.sessionContextMenu.visible ? renderSessionContextMenu() : ''}
       ${state.toast ? renderToast() : ''}
     </div>
   `;
 
   restoreFocusState(focusState);
+  autoResizeTitleField();
 
   const transcriptScroll = app.querySelector('[data-transcript-scroll]');
   if (transcriptScroll && shouldStickTranscriptToBottom) {
@@ -134,14 +166,14 @@ function renderSidebar() {
         </div>
       </div>
 
-      <div class="sidebar-content">
+      <div class="sidebar-content custom-scrollbar">
         <section class="sidebar-section">
           <div class="sidebar-section-title">
             <span>Folders</span>
-            <button class="text-btn" data-action="create-folder">+ 新建</button>
+            <button class="text-btn" data-action="open-create-folder-modal">+ 新建</button>
           </div>
           <div class="list">
-            <button class="list-item ${state.activeFolderId === '' ? 'active' : ''}" data-action="filter-folder" data-folder-id="">
+            <button class="list-item ${state.activeFolderId === '' ? 'active' : ''} ${state.dragOverFolderId === '__root__' ? 'drag-hover' : ''}" data-action="filter-folder" data-folder-id="" data-folder-drop-target="true">
               <span class="folder-icon">🗂️</span>
               <div class="list-copy">
                 <div class="list-title">全部记录</div>
@@ -155,9 +187,13 @@ function renderSidebar() {
         <section class="sidebar-section">
           <div class="sidebar-section-title">
             <span>Recent Sessions</span>
-            <button class="text-btn" data-action="refresh-data">刷新</button>
+            <div class="section-actions">
+              <button class="text-btn" data-action="toggle-selection-mode">${state.selectionMode ? '完成' : '多选'}</button>
+              <button class="text-btn" data-action="refresh-data">刷新</button>
+            </div>
           </div>
-          <div class="list">
+          ${renderBatchSessionActions()}
+          <div class="list session-list">
             ${filteredSessions.length === 0 ? `<div class="muted" style="font-size:13px;padding:4px 6px;">暂无符合条件的记录</div>` : filteredSessions.map(renderSessionItem).join('')}
           </div>
         </section>
@@ -179,8 +215,9 @@ function renderFolderItem(folder) {
   const color = folder.color || '#7c3aed';
   const active = folder.id === state.activeFolderId;
   const count = state.sessions.filter((s) => s.folder_id === folder.id).length;
+  const dragHover = state.dragOverFolderId === folder.id;
   return `
-    <button class="list-item ${active ? 'active' : ''}" data-action="filter-folder" data-folder-id="${folder.id}">
+    <button class="list-item ${active ? 'active' : ''} ${dragHover ? 'drag-hover' : ''}" data-action="filter-folder" data-folder-id="${folder.id}" data-folder-drop-target="true">
       <span class="list-item-dot" style="background:${escapeAttr(color)}"></span>
       <div class="list-copy">
         <div class="list-title">${escapeHtml(folder.name)}</div>
@@ -192,17 +229,37 @@ function renderFolderItem(folder) {
 
 function renderSessionItem(session) {
   const active = state.currentSession?.id === session.id;
+  const selected = state.selectedSessionIds.includes(session.id);
   const icon = session.mode === 'meeting' ? '👥' : '🎓';
   const meta = `${formatDate(session.created_at)} · ${session.mode}`;
   const fullTitle = session.title || 'Untitled Session';
   return `
-    <button class="list-item session-item ${active ? 'active' : ''}" data-action="open-session" data-session-id="${session.id}" title="${escapeAttr(fullTitle)}">
+    <button class="list-item session-item ${active ? 'active' : ''} ${selected ? 'selected' : ''}" data-action="open-session" data-session-id="${session.id}" data-session-item="true" draggable="true" title="${escapeAttr(fullTitle)}">
+      ${state.selectionMode ? `<span class="session-check ${selected ? 'checked' : ''}" data-action="toggle-session-select" data-session-id="${session.id}" aria-hidden="true">${selected ? '✓' : ''}</span>` : ''}
       <span class="session-icon">${icon}</span>
       <div class="list-copy">
-        <div class="list-title">${escapeHtml(compactTitle(fullTitle, 24))}</div>
+        <div class="list-title session-list-title">${escapeHtml(fullTitle)}</div>
         <div class="list-meta">${escapeHtml(meta)}</div>
       </div>
     </button>
+  `;
+}
+
+function renderBackgroundRecordingBanner() {
+  if (!isAnyRecordingActive()) return '';
+  const viewingRecordedSession = state.currentSession?.id === state.recording.sessionId;
+  const sessionTitle = escapeHtml(state.recording.sessionTitle || getRecordingSessionLabel());
+  return `
+    <div class="background-recording-banner">
+      <div class="background-recording-copy">
+        <div class="background-recording-title">${viewingRecordedSession ? '当前 session 正在录制' : '后台录制进行中'}</div>
+        <div class="background-recording-meta">${sessionTitle} · system audio${state.micEnabled ? ' + mic' : ''}${state.screenEnabled ? ' + screenshots' : ''}</div>
+      </div>
+      <div class="background-recording-actions">
+        ${viewingRecordedSession ? '' : `<button class="ghost-btn small" data-action="jump-to-recording-session">回到录制页面</button>`}
+        <button class="danger-btn small" data-action="stop-recording">■ Stop</button>
+      </div>
+    </div>
   `;
 }
 
@@ -254,7 +311,8 @@ function renderWorkspace() {
   if (!session) return renderHome();
 
   const modeClass = session.mode === 'meeting' ? 'meeting' : 'lecture';
-  const isRecording = session.status === 'recording' || session.status === 'starting';
+  const isRecording = isSessionActivelyRecording(session.id) || session.status === 'recording' || session.status === 'starting';
+  const recordingElsewhere = isAnyRecordingActive() && state.recording.sessionId !== session.id;
   const tabBadge = countActionItems(state.currentNote?.action_items);
 
   return `
@@ -268,12 +326,12 @@ function renderWorkspace() {
               ${isRecording ? `<span class="recording-indicator"><span class="recording-dot"></span>${session.status === 'starting' ? 'Starting…' : 'Recording'}</span>` : ''}
               ${session.status === 'completed' ? `<span class="chip blue">Completed</span>` : ''}
             </div>
-            <input
+            <textarea
               data-model="session-title"
               data-session-id="${session.id}"
-              value="${escapeAttr(session.title || '')}"
               placeholder="未命名记录"
-            />
+              rows="1"
+            >${escapeHtml(session.title || '')}</textarea>
           </div>
         </div>
 
@@ -287,8 +345,8 @@ function renderWorkspace() {
             </button>
           </div>
 
-          ${session.status === 'idle' || session.status === 'active' ? `
-            <button class="primary-btn" data-action="start-recording">▶ Start</button>
+          ${!isRecording ? `
+            <button class="primary-btn" data-action="start-recording" ${recordingElsewhere ? 'disabled' : ''}>▶ Start</button>
           ` : ''}
 
           ${isRecording ? `
@@ -301,7 +359,7 @@ function renderWorkspace() {
         </div>
       </header>
 
-      ${state.screenEnabled ? `
+      ${state.screenEnabled && isSessionActivelyRecording(session.id) ? `
         <div class="screen-banner">
           <div>🖥️ 屏幕视觉分析已开启。系统会基于共享画面定时抓帧，并把截图分析结果注入右侧 AI 面板。</div>
           <div><strong>${state.screenCaptures.length}</strong> 张已分析</div>
@@ -356,7 +414,13 @@ function renderTranscriptBody() {
     `;
   }
 
-  const lines = state.currentTranscript.map((line, idx) => {
+  const totalTranscriptItems = state.currentTranscript.length;
+  const transcriptItems = state.transcriptExpanded || totalTranscriptItems <= TRANSCRIPT_PREVIEW_LIMIT
+    ? state.currentTranscript
+    : state.currentTranscript.slice(-TRANSCRIPT_PREVIEW_LIMIT);
+  const hiddenCount = Math.max(0, totalTranscriptItems - transcriptItems.length);
+
+  const lines = transcriptItems.map((line, idx) => {
     if (line.type === 'screen_capture') {
       const captureId = String(line.id || `screen_${line.capture_time || line.start_time || idx}`);
       const expanded = Boolean(state.expandedScreenCaptures[captureId]);
@@ -401,7 +465,17 @@ function renderTranscriptBody() {
     </div>
   ` : '';
 
-  return `<div class="transcript-stack">${lines}${partial}</div>`;
+  const previewBanner = hiddenCount > 0 ? `
+    <div class="transcript-truncation-card">
+      <div>
+        <strong>已先展示最近 ${transcriptItems.length} 条内容</strong>
+        <div class="muted" style="margin-top:4px;">这个 session 较长。先渲染最近内容，避免页面卡死；需要时再展开完整 transcript。</div>
+      </div>
+      <button class="ghost-btn small" data-action="toggle-full-transcript">${state.transcriptExpanded ? '收起' : '显示全部'}</button>
+    </div>
+  ` : '';
+
+  return `<div class="transcript-stack">${previewBanner}${lines}${partial}</div>`;
 }
 
 function renderTabButton(id, icon, label, badge = '') {
@@ -423,9 +497,6 @@ function renderInsightBody() {
 
 function renderNotesTab() {
   const progress = renderProgressPanel('notes', 'AI 笔记生成状态');
-  const methodOptions = (state.noteMethods || []).map((method) => `
-    <option value="${escapeAttr(method.id)}" ${state.selectedNoteMethod === method.id ? 'selected' : ''}>${escapeHtml(method.name)}</option>
-  `).join('');
 
   if (!state.currentNote) {
     return `
@@ -434,16 +505,16 @@ function renderNotesTab() {
         <div class="note-toolbar">
           <div>
             <div class="note-toolbar-title">${state.currentSession?.mode === 'meeting' ? 'Meeting Minutes' : 'AI Notes'}</div>
-            <div class="muted" style="font-size:13px;margin-top:4px;">可以在生成前切换笔记方式。</div>
+            <div class="muted" style="font-size:13px;margin-top:4px;">AI 笔记改为手动生成；可以先选方式再触发。</div>
           </div>
           <div class="note-toolbar-actions">
-            ${renderNoteMethodPicker(methodOptions)}
+            ${renderNoteMethodPicker()}
             <button class="primary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>生成 AI 笔记</button>
           </div>
         </div>
         <div class="info-callout">
           <div>ℹ️</div>
-          <div>当前 session 还没有生成好的 AI 笔记。已有 transcript 的情况下，可以直接用右上角选择的记录方式触发真实后端生成。</div>
+          <div>当前 session 还没有生成好的 AI 笔记。为节省 token，停止录制后不会再自动生成；已有 transcript 时可手动触发。</div>
         </div>
       </div>
     `;
@@ -458,7 +529,7 @@ function renderNotesTab() {
           <div class="muted" style="font-size:13px;margin-top:4px;">当前方法：${escapeHtml(getNoteMethodLabel(state.currentNote.method || state.selectedNoteMethod || 'default'))}</div>
         </div>
         <div class="note-toolbar-actions">
-          ${renderNoteMethodPicker(methodOptions)}
+          ${renderNoteMethodPicker()}
           <button class="secondary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>重新生成</button>
         </div>
       </div>
@@ -467,15 +538,21 @@ function renderNotesTab() {
   `;
 }
 
-function renderNoteMethodPicker(methodOptions) {
+function renderNoteMethodPicker() {
+  const methods = state.noteMethods || [];
+  if (!methods.length) return '';
   return `
-    <label class="select-shell note-method-shell">
-      <span class="select-prefix">Style</span>
-      <select class="select-input note-method-select" data-model="selectedNoteMethod">
-        ${methodOptions}
-      </select>
-      <span class="select-chevron">⌄</span>
-    </label>
+    <div class="note-method-picker" role="tablist" aria-label="选择笔记方式">
+      ${methods.map((method) => {
+        const active = state.selectedNoteMethod === method.id;
+        const shortName = method.name.replace(/\s*Method$/i, '').replace(/\s*Minutes$/i, '');
+        const hint = method.id === 'cornell' ? 'Q / Notes / Summary' : method.id === 'outline' ? 'Hierarchy / Key Points' : 'Decisions / Sections';
+        return `<button class="method-chip ${active ? 'active' : ''}" data-action="select-note-method" data-method-id="${escapeAttr(method.id)}" role="tab" aria-selected="${active ? 'true' : 'false'}">
+          <span class="method-chip-title">${escapeHtml(shortName)}</span>
+          <span class="method-chip-hint">${escapeHtml(hint)}</span>
+        </button>`;
+      }).join('')}
+    </div>
   `;
 }
 
@@ -703,9 +780,128 @@ function renderToast() {
   return `<div class="toast ${state.toast.type === 'error' ? 'error' : ''}">${escapeHtml(state.toast.message)}</div>`;
 }
 
+function renderBatchSessionActions() {
+  if (!state.selectionMode) return '';
+  return `
+    <div class="batch-bar ${state.selectedSessionIds.length ? 'active' : ''}">
+      <div class="batch-copy">已选择 ${state.selectedSessionIds.length} 个 session</div>
+      <div class="batch-actions">
+        <button class="ghost-btn small" data-action="open-move-modal" ${state.selectedSessionIds.length ? '' : 'disabled'}>移动</button>
+        <button class="ghost-btn small danger-lite" data-action="delete-selected-sessions" ${state.selectedSessionIds.length ? '' : 'disabled'}>删除</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderSessionContextMenu() {
+  const menu = state.sessionContextMenu;
+  const session = state.sessions.find((item) => item.id === menu.sessionId);
+  if (!menu.visible || !session) return '';
+  return `
+    <div class="context-menu" style="left:${Math.max(12, menu.x)}px;top:${Math.max(12, menu.y)}px;">
+      <div class="context-menu-header">${escapeHtml(compactTitle(session.title || 'Untitled Session', 34))}</div>
+      <button class="context-menu-item" data-action="context-ai-rename" data-session-id="${session.id}">✨ AI rename</button>
+      <button class="context-menu-item" data-action="context-move-session" data-session-id="${session.id}">📁 Move to folder</button>
+      <button class="context-menu-item danger" data-action="context-delete-session" data-session-id="${session.id}">🗑 Delete</button>
+    </div>
+  `;
+}
+
+function renderFolderModal() {
+  const suggestions = getFolderSuggestions();
+  return `
+    <div class="modal-layer" data-action="close-folder-modal-layer">
+      <div class="modal folder-modal" data-modal-card="true">
+        <div class="modal-head">
+          <div>
+            <div class="modal-title">新建 Folder</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">给 folder 一个更明确的名字和颜色，后面拖拽或批量移动 session 会更顺手。</div>
+          </div>
+          <button class="icon-btn" data-action="close-folder-modal">×</button>
+        </div>
+        <div class="modal-body custom-scrollbar">
+          <div class="field-group">
+            <div class="field-label">Folder 名称</div>
+            <input class="text-input" data-model="folder-name" value="${escapeAttr(state.folderDraft.name || '')}" placeholder="例如：UCI Lectures / Product Weekly / Interview Prep" />
+          </div>
+          <div class="field-group">
+            <div class="field-label">建议名称</div>
+            <div class="suggestion-row">
+              ${suggestions.map((name) => `<button class="suggestion-chip" data-action="use-folder-suggestion" data-folder-name="${escapeAttr(name)}">${escapeHtml(name)}</button>`).join('')}
+            </div>
+          </div>
+          <div class="field-group">
+            <div class="field-label">颜色</div>
+            <div class="color-row">
+              ${getFolderColorOptions().map((color) => `<button class="color-swatch ${state.folderDraft.color === color ? 'active' : ''}" data-action="set-folder-color" data-color="${escapeAttr(color)}" style="--swatch:${escapeAttr(color)}"></button>`).join('')}
+            </div>
+          </div>
+          <div class="folder-preview">
+            <span class="list-item-dot" style="background:${escapeAttr(state.folderDraft.color || '#2962ff')}"></span>
+            <div>
+              <div class="folder-preview-title">${escapeHtml((state.folderDraft.name || 'New Folder').trim() || 'New Folder')}</div>
+              <div class="folder-preview-meta">预览你的 folder 样式</div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="ghost-btn" data-action="close-folder-modal">取消</button>
+          <button class="primary-btn" data-action="save-folder">创建 Folder</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderMoveModal() {
+  const targetIds = state.moveSessionIds || [];
+  const selectedCount = targetIds.length;
+  return `
+    <div class="modal-layer" data-action="close-move-modal-layer">
+      <div class="modal" data-modal-card="true">
+        <div class="modal-head">
+          <div>
+            <div class="modal-title">移动 Session</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">把 ${selectedCount} 个 session 移到指定 folder，也可以拖拽单个 session 到左侧 folder。</div>
+          </div>
+          <button class="icon-btn" data-action="close-move-modal">×</button>
+        </div>
+        <div class="modal-body custom-scrollbar">
+          <div class="move-list">
+            <button class="move-option ${state.moveTargetFolderId === '' ? 'active' : ''}" data-action="pick-move-target" data-folder-id="">
+              <span class="folder-icon">🗂️</span>
+              <div class="list-copy">
+                <div class="list-title">全部记录 / 不放入 folder</div>
+                <div class="list-meta">移出任何 folder</div>
+              </div>
+            </button>
+            ${state.folders.map((folder) => `<button class="move-option ${state.moveTargetFolderId === folder.id ? 'active' : ''}" data-action="pick-move-target" data-folder-id="${folder.id}">
+              <span class="list-item-dot" style="background:${escapeAttr(folder.color || '#7c3aed')}"></span>
+              <div class="list-copy">
+                <div class="list-title">${escapeHtml(folder.name)}</div>
+                <div class="list-meta">${state.sessions.filter((s) => s.folder_id === folder.id).length} 条 session</div>
+              </div>
+            </button>`).join('')}
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="ghost-btn" data-action="close-move-modal">取消</button>
+          <button class="primary-btn" data-action="confirm-move-sessions">确认移动</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 async function handleClick(event) {
   const actionEl = event.target.closest('[data-action]');
-  if (!actionEl) return;
+  if (!actionEl) {
+    if (state.sessionContextMenu.visible) {
+      closeContextMenu();
+      scheduleRender();
+    }
+    return;
+  }
   const action = actionEl.dataset.action;
 
   if (action === 'noop') return;
@@ -722,19 +918,85 @@ async function handleClick(event) {
         break;
       case 'filter-folder':
         state.activeFolderId = actionEl.dataset.folderId || '';
+        closeContextMenu();
         scheduleRender();
         break;
-      case 'create-folder':
+      case 'open-create-folder-modal':
+        openCreateFolderModal();
+        break;
+      case 'close-folder-modal':
+      case 'close-folder-modal-layer':
+        if (action === 'close-folder-modal-layer' && event.target !== actionEl) break;
+        state.showFolderModal = false;
+        scheduleRender();
+        break;
+      case 'use-folder-suggestion':
+        state.folderDraft.name = actionEl.dataset.folderName || '';
+        scheduleRender();
+        break;
+      case 'set-folder-color':
+        state.folderDraft.color = actionEl.dataset.color || '#2962ff';
+        scheduleRender();
+        break;
+      case 'save-folder':
         await createFolderFlow();
         break;
       case 'create-session':
         await createSessionFlow(actionEl.dataset.mode || 'lecture');
         break;
+      case 'toggle-selection-mode':
+        state.selectionMode = !state.selectionMode;
+        if (!state.selectionMode) state.selectedSessionIds = [];
+        scheduleRender();
+        break;
+      case 'toggle-session-select':
+        toggleSessionSelection(actionEl.dataset.sessionId);
+        scheduleRender();
+        break;
       case 'open-session':
+        if (state.selectionMode) {
+          toggleSessionSelection(actionEl.dataset.sessionId);
+          scheduleRender();
+          break;
+        }
         await openSession(actionEl.dataset.sessionId);
+        break;
+      case 'context-ai-rename':
+        closeContextMenu();
+        await autoRenameSession(actionEl.dataset.sessionId);
+        break;
+      case 'context-move-session':
+        closeContextMenu();
+        openMoveModal([actionEl.dataset.sessionId]);
+        break;
+      case 'context-delete-session':
+        closeContextMenu();
+        await deleteSessions([actionEl.dataset.sessionId]);
+        break;
+      case 'open-move-modal':
+        openMoveModal(state.selectedSessionIds);
+        break;
+      case 'close-move-modal':
+      case 'close-move-modal-layer':
+        if (action === 'close-move-modal-layer' && event.target !== actionEl) break;
+        state.showMoveModal = false;
+        scheduleRender();
+        break;
+      case 'pick-move-target':
+        state.moveTargetFolderId = actionEl.dataset.folderId || '';
+        scheduleRender();
+        break;
+      case 'confirm-move-sessions':
+        await confirmMoveModal();
+        break;
+      case 'delete-selected-sessions':
+        await deleteSessions(state.selectedSessionIds);
         break;
       case 'back-home':
         await leaveSession();
+        break;
+      case 'jump-to-recording-session':
+        if (state.recording.sessionId) await openSession(state.recording.sessionId, { keepView: true });
         break;
       case 'toggle-mic':
         await toggleMic();
@@ -752,8 +1014,16 @@ async function handleClick(event) {
         state.activeTab = actionEl.dataset.tab;
         scheduleRender();
         break;
+      case 'select-note-method':
+        state.selectedNoteMethod = actionEl.dataset.methodId || state.selectedNoteMethod;
+        scheduleRender();
+        break;
       case 'toggle-screen-capture':
         state.expandedScreenCaptures[actionEl.dataset.captureId || ''] = !state.expandedScreenCaptures[actionEl.dataset.captureId || ''];
+        scheduleRender();
+        break;
+      case 'toggle-full-transcript':
+        state.transcriptExpanded = !state.transcriptExpanded;
         scheduleRender();
         break;
       case 'generate-notes':
@@ -818,6 +1088,12 @@ function handleInput(event) {
     return;
   }
 
+  if (model === 'folder-name') {
+    state.folderDraft.name = event.target.value;
+    scheduleRender();
+    return;
+  }
+
   if (model === 'session-title') {
     const id = event.target.dataset.sessionId;
     if (state.currentSession?.id === id) {
@@ -832,10 +1108,6 @@ function handleInput(event) {
     return;
   }
 
-  if (model === 'selectedNoteMethod') {
-    state.selectedNoteMethod = event.target.value;
-    return;
-  }
 }
 
 function handleChange(event) {
@@ -856,25 +1128,109 @@ async function refreshSidebarData() {
   ]);
   state.folders = folders || [];
   state.sessions = sessions || [];
+  syncSidebarRecordingState();
+}
+
+function isAnyRecordingActive() {
+  return Boolean(state.recording.sessionId);
+}
+
+function isSessionActivelyRecording(sessionId) {
+  return Boolean(sessionId && state.recording.sessionId === sessionId);
+}
+
+function getRecordingSessionLabel() {
+  const matched = state.sessions.find((session) => session.id === state.recording.sessionId);
+  return matched?.title || state.recording.sessionTitle || 'Untitled Session';
+}
+
+function applyRecordingStateToSession(session) {
+  if (!session) return null;
+  const normalized = normalizeSession(session);
+  if (isSessionActivelyRecording(normalized.id)) {
+    normalized.status = 'recording';
+  }
+  return normalized;
+}
+
+function syncSidebarRecordingState() {
+  state.sessions = (state.sessions || []).map((session) => {
+    if (!session?.id) return session;
+    return {
+      ...session,
+      status: isSessionActivelyRecording(session.id) ? 'recording' : normalizeStatus(session.status),
+    };
+  });
+}
+
+function withTimeout(promise, ms, fallbackMessage = '请求超时') {
+  let timer = null;
+  return Promise.race([
+    promise.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(fallbackMessage)), ms);
+    }),
+  ]);
+}
+
+function setRecordingCachesFromCurrentSession() {
+  if (!state.currentSession) return;
+  state.recording.sessionId = state.currentSession.id;
+  state.recording.sessionMode = state.currentSession.mode || 'lecture';
+  state.recording.sessionTitle = state.currentSession.title || 'Untitled Session';
+  state.recording.liveTranscript = [...(state.currentTranscript || [])];
+  state.recording.liveSummaries = [...(state.currentSummaries || [])];
+  state.recording.liveScreenCaptures = [...(state.screenCaptures || [])];
+  state.recording.liveSpeakerMap = { ...(state.speakerMap || {}) };
+  state.recording.partialTranscript = state.partialTranscript || null;
+}
+
+function syncCurrentSessionWithRecordingCache() {
+  if (!state.currentSession || !isSessionActivelyRecording(state.currentSession.id)) return;
+  state.currentSession.status = 'recording';
+  state.currentTranscript = [...state.recording.liveTranscript];
+  state.currentSummaries = [...state.recording.liveSummaries];
+  state.currentNote = state.currentNote || null;
+  state.speakerMap = { ...state.recording.liveSpeakerMap };
+  state.screenCaptures = [...state.recording.liveScreenCaptures];
+  state.partialTranscript = state.recording.partialTranscript || null;
+}
+
+function clearRecordingSessionState() {
+  state.recording.sessionId = '';
+  state.recording.sessionMode = 'lecture';
+  state.recording.sessionTitle = '';
+  state.recording.liveTranscript = [];
+  state.recording.liveSummaries = [];
+  state.recording.liveScreenCaptures = [];
+  state.recording.liveSpeakerMap = {};
+  state.recording.partialTranscript = null;
 }
 
 async function createFolderFlow() {
   if (state.creatingFolder) return;
-  state.creatingFolder = true;
-  const name = window.prompt('新建文件夹名称：', 'New Folder');
+  const name = (state.folderDraft.name || '').trim();
   if (!name) {
-    state.creatingFolder = false;
+    showToast('请输入 folder 名称。', 'error');
     return;
   }
-  const folder = await api('/api/folders', {
-    method: 'POST',
-    body: JSON.stringify({ name }),
-  });
-  state.folders.unshift(folder);
-  state.activeFolderId = folder.id;
-  state.creatingFolder = false;
-  showToast('文件夹已创建。');
-  scheduleRender();
+  state.creatingFolder = true;
+  try {
+    const folder = await api('/api/folders', {
+      method: 'POST',
+      body: JSON.stringify({ name, color: state.folderDraft.color || '#2962ff' }),
+    });
+    state.folders.unshift(folder);
+    state.activeFolderId = folder.id;
+    state.showFolderModal = false;
+    state.folderDraft = { name: '', color: '#2962ff' };
+    showToast('文件夹已创建。');
+  } finally {
+    state.creatingFolder = false;
+    scheduleRender();
+  }
 }
 
 async function createSessionFlow(mode) {
@@ -889,49 +1245,86 @@ async function createSessionFlow(mode) {
   });
   await refreshSidebarData();
   await openSession(session.id, { keepView: true });
-  state.micEnabled = false;
-  state.screenEnabled = false;
+  if (!isAnyRecordingActive()) {
+    state.micEnabled = false;
+    state.screenEnabled = false;
+  }
   showToast(`${mode === 'lecture' ? 'Lecture' : 'Meeting'} session 已创建。`);
 }
 
 async function openSession(sessionId, options = {}) {
-  await cleanupAllMedia();
+  const openToken = ++latestOpenSessionToken;
   state.loadingSession = true;
+  state.transcriptExpanded = false;
   state.view = 'session';
-  scheduleRender();
-
-  const [session, chunks, summaries, note, speakers, screenCaptures] = await Promise.all([
-    api(`/api/sessions/${sessionId}`),
-    api(`/api/sessions/${sessionId}/chunks`),
-    api(`/api/sessions/${sessionId}/summaries`),
-    api(`/api/sessions/${sessionId}/notes`).catch(() => null),
-    api(`/api/sessions/${sessionId}/speaker-map`).catch(() => ({})),
-    api(`/api/sessions/${sessionId}/screen-captures`).catch(() => ([])),
-  ]);
-
-  const noteMethods = await api(`/api/note-methods?mode=${encodeURIComponent(session?.mode || 'lecture')}`).catch(() => ([]));
-
-  state.currentSession = normalizeSession(session);
-  state.currentTranscript = hydrateTranscript(chunks, screenCaptures);
-  state.currentSummaries = summaries || [];
-  state.currentNote = note || null;
-  state.speakerMap = speakers || {};
-  state.screenCaptures = screenCaptures || [];
   state.expandedScreenCaptures = {};
-  state.noteMethods = noteMethods || [];
-  state.selectedNoteMethod = note?.method || getDefaultNoteMethod(session?.mode, noteMethods);
-  state.qaMessages = [];
-  state.qaInput = '';
-  state.partialTranscript = null;
-  state.activeTab = 'notes';
-  state.loadingSession = false;
 
-  if (!options.keepView) state.view = 'session';
+  const cached = state.sessions.find((item) => item.id === sessionId);
+  if (cached) {
+    state.currentSession = applyRecordingStateToSession(cached);
+  }
   scheduleRender();
+
+  try {
+    const session = await withTimeout(api(`/api/sessions/${sessionId}`), 12000, '加载 session 基本信息超时。');
+    if (openToken !== latestOpenSessionToken) return;
+
+    state.currentSession = applyRecordingStateToSession(session);
+    state.currentTranscript = [];
+    state.currentSummaries = [];
+    state.currentNote = null;
+    state.speakerMap = {};
+    state.screenCaptures = [];
+    state.partialTranscript = null;
+    state.qaMessages = [];
+    state.qaInput = '';
+    state.noteMethods = [];
+    state.selectedNoteMethod = '';
+    if (!options.keepView) state.view = 'session';
+    state.loadingSession = false;
+    scheduleRender();
+
+    const [chunksResult, summariesResult, noteResult, speakersResult, screenCapturesResult, noteMethodsResult] = await Promise.allSettled([
+      withTimeout(api(`/api/sessions/${sessionId}/chunks`), 12000, '加载 transcript 超时。'),
+      withTimeout(api(`/api/sessions/${sessionId}/summaries`), 8000, '加载 summaries 超时。'),
+      withTimeout(api(`/api/sessions/${sessionId}/notes`).catch(() => null), 5000, '加载 notes 超时。'),
+      withTimeout(api(`/api/sessions/${sessionId}/speaker-map`).catch(() => ({})), 5000, '加载 speaker map 超时。'),
+      withTimeout(api(`/api/sessions/${sessionId}/screen-captures`).catch(() => ([])), 6000, '加载 screen captures 超时。'),
+      withTimeout(api(`/api/note-methods?mode=${encodeURIComponent(session?.mode || 'lecture')}`).catch(() => ([])), 4000, '加载 note methods 超时。'),
+    ]);
+
+    if (openToken !== latestOpenSessionToken) return;
+
+    const chunks = chunksResult.status === 'fulfilled' ? chunksResult.value : [];
+    const summaries = summariesResult.status === 'fulfilled' ? summariesResult.value : [];
+    const note = noteResult.status === 'fulfilled' ? noteResult.value : null;
+    const speakers = speakersResult.status === 'fulfilled' ? speakersResult.value : {};
+    const screenCaptures = screenCapturesResult.status === 'fulfilled' ? screenCapturesResult.value : [];
+    const noteMethods = noteMethodsResult.status === 'fulfilled' ? noteMethodsResult.value : [];
+
+    state.currentSession = applyRecordingStateToSession(session);
+    state.currentTranscript = hydrateTranscript(chunks, screenCaptures);
+    state.currentSummaries = summaries || [];
+    state.currentNote = note || null;
+    state.speakerMap = speakers || {};
+    state.screenCaptures = screenCaptures || [];
+    state.noteMethods = noteMethods || [];
+    state.selectedNoteMethod = note?.method || getDefaultNoteMethod(session?.mode, noteMethods);
+    state.partialTranscript = null;
+    syncCurrentSessionWithRecordingCache();
+
+    if (chunksResult.status !== 'fulfilled') {
+      showToast('这个旧 session 的 transcript 比较大，已先跳过阻塞加载；你仍然可以继续查看其他内容。', 'error');
+    }
+  } finally {
+    if (openToken === latestOpenSessionToken) {
+      state.loadingSession = false;
+      scheduleRender();
+    }
+  }
 }
 
 async function leaveSession() {
-  await cleanupAllMedia();
   state.view = 'home';
   state.currentSession = null;
   state.currentTranscript = [];
@@ -945,6 +1338,7 @@ async function leaveSession() {
   state.qaInput = '';
   state.noteMethods = [];
   state.selectedNoteMethod = '';
+  state.transcriptExpanded = false;
   resetAllProgress();
   scheduleRender();
 }
@@ -954,7 +1348,7 @@ async function toggleMic() {
   state.micEnabled = next;
   scheduleRender();
 
-  if (state.currentSession?.status === 'recording') {
+  if (isAnyRecordingActive()) {
     if (next) {
       await attachMicStream();
       showToast('麦克风输入已打开。');
@@ -969,7 +1363,7 @@ async function toggleScreen() {
   state.screenEnabled = !state.screenEnabled;
   scheduleRender();
 
-  if (state.currentSession?.status === 'recording') {
+  if (isAnyRecordingActive()) {
     if (state.screenEnabled) {
       ensureScreenCaptureLoop();
       showToast('屏幕视觉分析已开启。');
@@ -983,9 +1377,13 @@ async function toggleScreen() {
 async function startRecording() {
   const session = state.currentSession;
   if (!session) throw new Error('请先创建或打开一个 session。');
-  if (session.status === 'recording' || session.status === 'starting') return;
+  if (isAnyRecordingActive() && state.recording.sessionId !== session.id) {
+    throw new Error('已有另一个 session 在后台录制。请先停止后再开始新的录制。');
+  }
+  if (isSessionActivelyRecording(session.id) || session.status === 'recording' || session.status === 'starting') return;
 
   session.status = 'starting';
+  setRecordingCachesFromCurrentSession();
   scheduleRender();
 
   let displayStream;
@@ -996,6 +1394,7 @@ async function startRecording() {
     });
   } catch (err) {
     session.status = 'idle';
+    clearRecordingSessionState();
     scheduleRender();
     throw new Error('需要先授权共享屏幕/标签页，并勾选系统音频。');
   }
@@ -1003,6 +1402,7 @@ async function startRecording() {
   if (!displayStream.getAudioTracks().length) {
     displayStream.getTracks().forEach((track) => track.stop());
     session.status = 'idle';
+    clearRecordingSessionState();
     scheduleRender();
     throw new Error('当前共享源没有系统音频。请重新选择支持“Share tab audio / 系统音频”的来源。');
   }
@@ -1017,7 +1417,7 @@ async function startRecording() {
   const videoTrack = displayStream.getVideoTracks()[0];
   if (videoTrack) {
     videoTrack.addEventListener('ended', async () => {
-      if (state.currentSession?.status === 'recording' || state.currentSession?.status === 'starting') {
+      if (isAnyRecordingActive()) {
         showToast('屏幕共享已结束，当前录制也会同步停止。');
         await stopRecording(true);
       }
@@ -1041,19 +1441,23 @@ async function startRecording() {
   resetProgress('notes');
   resetProgress('action_items');
   session.status = 'recording';
+  syncSidebarRecordingState();
   scheduleRender();
-  showToast('录制已开始。');
+  showToast('录制已开始。切到别的 session 后也会继续在后台运行。');
 }
 
 async function stopRecording(fromShareEnded = false) {
-  const session = state.currentSession;
-  if (!session) return;
+  const recordedSessionId = state.recording.sessionId;
+  if (!recordedSessionId) return;
+  const viewingRecordedSession = state.currentSession?.id === recordedSessionId;
 
   if (state.recording.ws && state.recording.ws.readyState === WebSocket.OPEN) {
     state.recording.ws.send(JSON.stringify({ type: 'stop_session' }));
   }
 
   stopScreenCaptureLoop();
+  clearInterval(state.recording.notePollTimer);
+  state.recording.notePollTimer = null;
   detachMicStream();
   if (state.recording.displaySource) {
     try { state.recording.displaySource.disconnect(); } catch {}
@@ -1061,9 +1465,11 @@ async function stopRecording(fromShareEnded = false) {
   }
   if (state.recording.processor) {
     try { state.recording.processor.disconnect(); } catch {}
+    state.recording.processor = null;
   }
   if (state.recording.zeroGain) {
     try { state.recording.zeroGain.disconnect(); } catch {}
+    state.recording.zeroGain = null;
   }
   if (state.recording.audioContext) {
     try { await state.recording.audioContext.close(); } catch {}
@@ -1078,18 +1484,27 @@ async function stopRecording(fromShareEnded = false) {
     state.recording.videoEl.srcObject = null;
     state.recording.videoEl = null;
   }
+  if (state.recording.ws) {
+    try { state.recording.ws.close(); } catch {}
+    state.recording.ws = null;
+  }
 
-  session.status = 'completed';
-  state.partialTranscript = null;
-  startProgress('notes', '正在整理 AI 笔记');
-  startProgress('action_items', '正在提取待办事项');
+  clearRecordingSessionState();
+  syncSidebarRecordingState();
+
+  if (viewingRecordedSession && state.currentSession) {
+    state.currentSession.status = 'completed';
+    state.partialTranscript = null;
+  }
+
+  await refreshSidebarData().catch(() => {});
+  if (viewingRecordedSession) {
+    await refreshSessionData(recordedSessionId).catch(() => {});
+  }
   scheduleRender();
 
-  startNotePolling();
-  await refreshSessionData(session.id).catch(() => {});
-
   if (!fromShareEnded) {
-    showToast('录制已停止，正在等待后端生成 notes / action items。');
+    showToast('录制已停止。AI 笔记改为手动生成；Concept recap 仍会自动检测。');
   }
 }
 
@@ -1138,6 +1553,8 @@ async function cleanupAllMedia() {
     state.recording.videoEl.srcObject = null;
     state.recording.videoEl = null;
   }
+  clearRecordingSessionState();
+  syncSidebarRecordingState();
 }
 
 async function setupAudioPipeline() {
@@ -1201,7 +1618,12 @@ function detachMicStream() {
 
 async function openSessionSocket() {
   return new Promise((resolve, reject) => {
-    const session = state.currentSession;
+    const sessionId = state.recording.sessionId;
+    const sessionMode = state.recording.sessionMode || state.currentSession?.mode || 'lecture';
+    if (!sessionId) {
+      reject(new Error('录制 session 尚未初始化。'));
+      return;
+    }
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${protocol}://${location.host}/ws`);
     ws.binaryType = 'arraybuffer';
@@ -1211,8 +1633,8 @@ async function openSessionSocket() {
     ws.onopen = () => {
       ws.send(JSON.stringify({
         type: 'start_session',
-        session_id: session.id,
-        session_mode: session.mode,
+        session_id: sessionId,
+        session_mode: sessionMode,
         summary_mode: 'time',
         summary_interval: 5,
       }));
@@ -1245,64 +1667,94 @@ async function openSessionSocket() {
 
 function handleSocketMessage(message) {
   const { type, data } = message;
+  const viewingRecordingSession = state.currentSession?.id && isSessionActivelyRecording(state.currentSession.id);
 
   if (type === 'partial_transcript') {
-    state.partialTranscript = data;
-    scheduleRender();
+    state.recording.partialTranscript = data;
+    if (viewingRecordingSession) {
+      state.partialTranscript = data;
+      scheduleRender();
+    }
     return;
   }
 
   if (type === 'final_transcript') {
-    state.partialTranscript = null;
     const segments = normalizeFinalTranscriptPayload(data);
-    state.currentTranscript.push(...segments);
-    scheduleRender();
+    state.recording.partialTranscript = null;
+    if (segments.length) {
+      state.recording.liveTranscript.push(...segments);
+    }
+    if (viewingRecordingSession) {
+      state.partialTranscript = null;
+      state.currentTranscript.push(...segments);
+      scheduleRender();
+    }
     return;
   }
 
   if (type === 'speaker_renamed') {
     if (data?.speaker_key) {
-      state.speakerMap[data.speaker_key] = data.display_name;
-      scheduleRender();
+      state.recording.liveSpeakerMap[data.speaker_key] = data.display_name;
+      if (viewingRecordingSession) {
+        state.speakerMap[data.speaker_key] = data.display_name;
+        scheduleRender();
+      }
     }
     return;
   }
 
   if (type === 'screen_capture_analyzed') {
     const screenItem = { ...data, type: 'screen_capture' };
-    state.screenCaptures.push(screenItem);
-    state.currentTranscript.push(screenItem);
-    scheduleRender();
+    state.recording.liveScreenCaptures.push(screenItem);
+    state.recording.liveTranscript.push(screenItem);
+    if (viewingRecordingSession) {
+      state.screenCaptures.push(screenItem);
+      state.currentTranscript.push(screenItem);
+      scheduleRender();
+    }
     return;
   }
 
   if (type === 'concept_recap') {
-    state.currentSummaries.push({
+    const recapItem = {
       summary_type: 'concept',
       topic_label: data?.concept_title,
       summary_text: data?.content,
       start_time: data?.start_time,
       end_time: data?.end_time,
-    });
-    scheduleRender();
+    };
+    state.recording.liveSummaries.push(recapItem);
+    if (viewingRecordingSession) {
+      state.currentSummaries.push(recapItem);
+      scheduleRender();
+    }
     return;
   }
 
   if (type === 'notes_generated') {
-    state.currentNote = data;
-    finishProgress('notes', 'AI 笔记已生成');
-    finishProgress('action_items', '待办事项已提取');
-    clearInterval(state.recording.notePollTimer);
-    state.recording.notePollTimer = null;
-    scheduleRender();
-    showToast('AI 笔记与待办事项已生成。');
+    if (viewingRecordingSession) {
+      state.currentNote = data;
+      finishProgress('notes', 'AI 笔记已生成');
+      finishProgress('action_items', '待办事项已提取');
+      clearInterval(state.recording.notePollTimer);
+      state.recording.notePollTimer = null;
+      scheduleRender();
+      showToast('AI 笔记与待办事项已生成。');
+    }
     return;
   }
 
   if (type === 'session_updated') {
-    if (data?.title) state.currentSession.title = data.title;
-    if (data?.status) state.currentSession.status = normalizeStatus(data.status);
+    if (data?.title) state.recording.sessionTitle = data.title;
+    if (state.currentSession && state.currentSession.id === state.recording.sessionId) {
+      if (data?.title) state.currentSession.title = data.title;
+      if (data?.status) state.currentSession.status = normalizeStatus(data.status);
+    }
     refreshSidebarData().then(scheduleRender).catch(() => {});
+    return;
+  }
+
+  if (type === 'session_stopped' || type === 'transcriber_closed') {
     return;
   }
 
@@ -1367,13 +1819,14 @@ async function refreshSessionData(sessionId) {
 
   if (!state.currentSession || state.currentSession.id !== sessionId) return;
 
-  state.currentSession = normalizeSession(latestSession);
+  state.currentSession = applyRecordingStateToSession(latestSession);
   state.currentTranscript = hydrateTranscript(chunks, screenCaptures);
   state.currentSummaries = summaries || [];
   state.currentNote = note || state.currentNote;
   state.speakerMap = speakers || {};
   state.screenCaptures = screenCaptures || [];
   state.expandedScreenCaptures = {};
+  syncCurrentSessionWithRecordingCache();
   scheduleRender();
 }
 
@@ -1923,6 +2376,100 @@ function compactTitle(title = '', max = 32) {
   return value.length > max ? `${value.slice(0, Math.max(6, max - 1))}…` : value;
 }
 
+function getFolderColorOptions() {
+  return ['#2962ff', '#7c3aed', '#06b6d4', '#10b981', '#f59e0b', '#ef4444', '#f97316', '#ec4899'];
+}
+
+function getFolderSuggestions() {
+  const base = ['UCI Lectures', 'Product Weekly', 'Research Notes', 'Interview Prep', 'Team Sync', 'Personal Review'];
+  return base.filter((name) => !state.folders.some((folder) => folder.name === name)).slice(0, 6);
+}
+
+function openCreateFolderModal() {
+  state.folderDraft = {
+    name: state.folderDraft.name || getFolderSuggestions()[0] || '',
+    color: state.folderDraft.color || '#2962ff',
+  };
+  state.showFolderModal = true;
+  scheduleRender();
+}
+
+function toggleSessionSelection(sessionId) {
+  if (!sessionId) return;
+  if (state.selectedSessionIds.includes(sessionId)) {
+    state.selectedSessionIds = state.selectedSessionIds.filter((id) => id !== sessionId);
+  } else {
+    state.selectedSessionIds = [...state.selectedSessionIds, sessionId];
+  }
+}
+
+function closeContextMenu() {
+  state.sessionContextMenu = { visible: false, sessionId: '', x: 0, y: 0 };
+}
+
+function openMoveModal(sessionIds = []) {
+  const uniqueIds = Array.from(new Set((sessionIds || []).filter(Boolean)));
+  if (!uniqueIds.length) {
+    showToast('先选择至少一个 session。', 'error');
+    return;
+  }
+  state.moveSessionIds = uniqueIds;
+  state.moveTargetFolderId = '';
+  state.showMoveModal = true;
+  scheduleRender();
+}
+
+async function confirmMoveModal() {
+  if (!state.moveSessionIds.length) return;
+  await moveSessionsToFolder(state.moveSessionIds, state.moveTargetFolderId || null);
+  state.showMoveModal = false;
+  state.selectionMode = false;
+  state.selectedSessionIds = [];
+  scheduleRender();
+}
+
+async function moveSessionsToFolder(sessionIds, folderId) {
+  const ids = Array.from(new Set((sessionIds || []).filter(Boolean)));
+  if (!ids.length) return;
+  await Promise.all(ids.map((id) => api(`/api/sessions/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ folder_id: folderId || null }),
+  })));
+  if (state.currentSession && ids.includes(state.currentSession.id)) {
+    state.currentSession.folder_id = folderId || null;
+  }
+  await refreshSidebarData();
+  showToast(ids.length > 1 ? '已批量移动 session。' : 'Session 已移动。');
+}
+
+async function deleteSessions(sessionIds) {
+  const ids = Array.from(new Set((sessionIds || []).filter(Boolean)));
+  if (!ids.length) {
+    showToast('先选择至少一个 session。', 'error');
+    return;
+  }
+  const confirmed = window.confirm(ids.length > 1 ? `确定删除这 ${ids.length} 个 session 吗？` : '确定删除这个 session 吗？');
+  if (!confirmed) return;
+  await Promise.all(ids.map((id) => api(`/api/sessions/${id}`, { method: 'DELETE' })));
+  if (state.currentSession && ids.includes(state.currentSession.id)) {
+    await leaveSession();
+  }
+  state.selectedSessionIds = [];
+  state.selectionMode = false;
+  await refreshSidebarData();
+  showToast(ids.length > 1 ? '已删除所选 session。' : 'Session 已删除。');
+  scheduleRender();
+}
+
+async function autoRenameSession(sessionId) {
+  if (!sessionId) return;
+  const result = await api(`/api/sessions/${sessionId}/auto-title`, { method: 'POST' });
+  if (state.currentSession?.id === sessionId && result?.title) state.currentSession.title = result.title;
+  await refreshSidebarData();
+  scheduleRender();
+  showToast('AI rename 已完成。');
+}
+
 function getDefaultNoteMethod(mode = 'lecture', methods = []) {
   if (methods?.length) return methods[0].id;
   return mode === 'meeting' ? 'meeting' : 'cornell';
@@ -2125,6 +2672,96 @@ function cssEscape(value) {
   return String(value || '').replace(/([\"#.;?+*~':^$\[\]()=>|/@])/g, '\\$1');
 }
 
+
+function handleContextMenu(event) {
+  const sessionEl = event.target.closest('[data-session-item="true"]');
+  if (!sessionEl) {
+    if (state.sessionContextMenu.visible) {
+      closeContextMenu();
+      scheduleRender();
+    }
+    return;
+  }
+  event.preventDefault();
+  const sessionId = sessionEl.dataset.sessionId || '';
+  state.sessionContextMenu = {
+    visible: true,
+    sessionId,
+    x: Math.min(event.clientX, window.innerWidth - 220),
+    y: Math.min(event.clientY, window.innerHeight - 180),
+  };
+  scheduleRender();
+}
+
+function handleDragStart(event) {
+  const sessionEl = event.target.closest('[data-session-item="true"]');
+  if (!sessionEl) return;
+  const sessionId = sessionEl.dataset.sessionId || '';
+  if (!sessionId) return;
+  state.draggingSessionId = sessionId;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/session-id', sessionId);
+  }
+}
+
+function handleDragEnd() {
+  state.draggingSessionId = '';
+  if (state.dragOverFolderId) {
+    state.dragOverFolderId = '';
+    scheduleRender();
+  }
+}
+
+function handleDragOver(event) {
+  const folderEl = event.target.closest('[data-folder-drop-target="true"]');
+  if (!folderEl) return;
+  event.preventDefault();
+  const folderId = folderEl.dataset.folderId === '' ? '__root__' : (folderEl.dataset.folderId || '');
+  if (state.dragOverFolderId !== folderId) {
+    state.dragOverFolderId = folderId;
+    scheduleRender();
+  }
+}
+
+async function handleDrop(event) {
+  const folderEl = event.target.closest('[data-folder-drop-target="true"]');
+  if (!folderEl) return;
+  event.preventDefault();
+  const rawFolderId = folderEl.dataset.folderId || '';
+  const sessionId = (event.dataTransfer && event.dataTransfer.getData('text/session-id')) || state.draggingSessionId;
+  state.dragOverFolderId = '';
+  state.draggingSessionId = '';
+  if (!sessionId) return;
+  await moveSessionsToFolder([sessionId], rawFolderId || null);
+  scheduleRender();
+}
+
+function handleKeyDown(event) {
+  if (event.key === 'Escape') {
+    let changed = false;
+    if (state.sessionContextMenu.visible) {
+      closeContextMenu();
+      changed = true;
+    }
+    if (state.showMoveModal) {
+      state.showMoveModal = false;
+      changed = true;
+    }
+    if (state.showFolderModal) {
+      state.showFolderModal = false;
+      changed = true;
+    }
+    if (changed) scheduleRender();
+  }
+}
+
+function autoResizeTitleField() {
+  const field = app.querySelector('[data-model="session-title"]');
+  if (!field) return;
+  field.style.height = '0px';
+  field.style.height = `${Math.max(40, field.scrollHeight)}px`;
+}
 
 function showToast(message, type = 'info') {
   state.toast = { message, type };

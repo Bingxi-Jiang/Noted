@@ -553,47 +553,28 @@ function stopSession(sessionId) {
   if (session.transcriber) { session.transcriber.close(); session.transcriber = null; }
   broadcastToSession(sessionId, { type: 'session_stopped', data: {} });
 
-  if (GEMINI_KEY) {
-    const chunks = getAllChunks(sessionId);
-    if (chunks.length > 0) {
-      const dbSession = getSession(sessionId);
-      const sessionMode = dbSession?.mode || 'lecture';
+  const chunks = getAllChunks(sessionId);
+  if (chunks.length === 0) {
+    updateSession(sessionId, { status: 'completed' });
+    broadcastToSession(sessionId, { type: 'session_updated', data: { status: 'completed' } });
+    return;
+  }
 
-      // Auto-title if still default name
-      if (dbSession?.title?.startsWith('Session ')) {
-        generateSessionTitle(GEMINI_KEY, chunks).then(title => {
-          updateSession(sessionId, { title: title.trim(), status: 'completed' });
-          broadcastToSession(sessionId, { type: 'session_updated', data: { title: title.trim(), status: 'completed' } });
-        }).catch(e => console.error('[AutoTitle]', e.message));
-      } else {
-        updateSession(sessionId, { status: 'completed' });
-      }
+  const dbSession = getSession(sessionId);
 
-      // Auto-generate notes with mode-appropriate method
-      const summaries = getSummaries(sessionId);
-      const defaultMethod = sessionMode === 'meeting' ? 'meeting' : 'cornell';
-      const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sessionId) : {};
-      const screenCaptures = getScreenCaptures(sessionId);
-      Promise.all([
-        generateNotes(GEMINI_KEY, chunks, summaries, defaultMethod, speakerNameMap, screenCaptures),
-        extractActionItems(GEMINI_KEY, chunks, sessionMode, speakerNameMap, screenCaptures),
-      ]).then(([content, actionItemsResult]) => {
-        const noteId = uuid();
-        const actionItemsLogText = JSON.stringify(actionItemsResult.log, null, 2);
-        logActionItemsExtraction(sessionId, sessionMode, actionItemsResult.actionItemsMarkdown, actionItemsResult.log);
-        upsertNote(noteId, sessionId, defaultMethod, content, actionItemsResult.actionItemsMarkdown, actionItemsLogText);
-        broadcastToSession(sessionId, {
-          type: 'notes_generated',
-          data: {
-            id: noteId,
-            method: defaultMethod,
-            content,
-            action_items: actionItemsResult.actionItemsMarkdown,
-            action_items_log: actionItemsResult.log,
-          }
-        });
-      }).catch(e => console.error('[AutoNotes]', e.message));
-    }
+  // Keep auto-title, but AI notes/action items are now manual-only to save tokens.
+  if (GEMINI_KEY && dbSession?.title?.startsWith('Session ')) {
+    generateSessionTitle(GEMINI_KEY, chunks).then(title => {
+      updateSession(sessionId, { title: title.trim(), status: 'completed' });
+      broadcastToSession(sessionId, { type: 'session_updated', data: { title: title.trim(), status: 'completed' } });
+    }).catch(e => {
+      console.error('[AutoTitle]', e.message);
+      updateSession(sessionId, { status: 'completed' });
+      broadcastToSession(sessionId, { type: 'session_updated', data: { status: 'completed' } });
+    });
+  } else {
+    updateSession(sessionId, { status: 'completed' });
+    broadcastToSession(sessionId, { type: 'session_updated', data: { status: 'completed' } });
   }
 }
 
