@@ -1,5 +1,11 @@
 const app = document.getElementById('app');
 
+const ACCOUNT_STORAGE_KEY = 'scribe_accounts_v1';
+const ACTIVE_ACCOUNT_STORAGE_KEY = 'scribe_active_account_v1';
+const THEME_STORAGE_KEY = 'scribe_theme_v1';
+const GOOGLE_TOKEN_STORAGE_KEY = 'scribe_google_tokens_v1';
+const GOOGLE_AUTH_SCOPE = 'openid email profile https://www.googleapis.com/auth/drive.file';
+
 const state = {
   view: 'home',
   sidebarOpen: true,
@@ -20,6 +26,7 @@ const state = {
   screenEnabled: false,
   showExportModal: false,
   showSpeakerModal: false,
+  showSettingsModal: false,
   exportFormat: 'pdf',
   exportDestination: 'download',
   exportBusy: false,
@@ -43,11 +50,18 @@ const state = {
   dragOverFolderId: '',
   draggingSessionId: '',
   toast: null,
+  theme: 'light',
+  accounts: [],
+  activeAccountId: '',
+  authBusy: false,
+  authTokens: {},
+  emailAccountDraft: { firstName: '', lastName: '', email: '' },
+  confirmDialog: null,
   progress: {
-    notes: createProgressState('等待生成'),
-    action_items: createProgressState('等待提取'),
-    recaps: createProgressState('等待总结'),
-    qa: createProgressState('等待提问'),
+    notes: createProgressState('Waiting to generate'),
+    action_items: createProgressState('Waiting to extract'),
+    recaps: createProgressState('Waiting to summarize'),
+    qa: createProgressState('Waiting for a question'),
   },
   recording: {
     sessionId: '',
@@ -75,12 +89,15 @@ const state = {
 const titleSaveTimers = new Map();
 let renderScheduled = false;
 let toastTimer = null;
+let pendingConfirmResolver = null;
 let latestOpenSessionToken = 0;
 const TRANSCRIPT_PREVIEW_LIMIT = 320;
 
 boot();
 
 async function boot() {
+  hydrateClientPreferences();
+  applyTheme();
   attachGlobalHandlers();
   await refreshSidebarData();
   scheduleRender();
@@ -121,15 +138,17 @@ function render() {
     <div class="app-shell">
       ${renderSidebar()}
       <main class="main">
-        ${!state.sidebarOpen ? '<div class="sidebar-peek-btn"><button class="icon-btn" data-action="toggle-sidebar" title="展开侧边栏">☰</button></div>' : ''}
+        ${!state.sidebarOpen ? '<div class="sidebar-peek-btn"><button class="icon-btn" data-action="toggle-sidebar" title="Expand sidebar">☰</button></div>' : ''}
         ${renderBackgroundRecordingBanner()}
         ${state.view === 'home' ? renderHome() : renderWorkspace()}
       </main>
       ${state.showExportModal ? renderExportModal() : ''}
       ${state.showSpeakerModal ? renderSpeakerModal() : ''}
+      ${state.showSettingsModal ? renderSettingsModal() : ''}
       ${state.showFolderModal ? renderFolderModal() : ''}
       ${state.showMoveModal ? renderMoveModal() : ''}
       ${state.sessionContextMenu.visible ? renderSessionContextMenu() : ''}
+      ${state.confirmDialog ? renderConfirmModal() : ''}
       ${state.toast ? renderToast() : ''}
     </div>
   `;
@@ -158,11 +177,11 @@ function renderSidebar() {
   return `
     <aside class="sidebar ${state.sidebarOpen ? '' : 'collapsed'}">
       <div class="sidebar-header">
-        <div class="brand-title">Scribe Nexus</div>
-        <div class="brand-subtitle">实时转写、AI 笔记、Action Items、Q&A 一体化工作台</div>
+        <div class="brand-title">Noted</div>
+        <div class="brand-subtitle">Live transcription, AI notes, action items, and Q&A in one workspace</div>
         <div class="search-box">
           <span class="search-icon">⌕</span>
-          <input data-model="searchQuery" value="${escapeAttr(state.searchQuery)}" placeholder="搜索文件夹 / 记录..." />
+          <input data-model="searchQuery" value="${escapeAttr(state.searchQuery)}" placeholder="Search folders / sessions..." />
         </div>
       </div>
 
@@ -170,17 +189,17 @@ function renderSidebar() {
         <section class="sidebar-section">
           <div class="sidebar-section-title">
             <span>Folders</span>
-            <button class="text-btn" data-action="open-create-folder-modal">+ 新建</button>
+            <button class="text-btn" data-action="open-create-folder-modal">+ New</button>
           </div>
           <div class="list">
             <button class="list-item ${state.activeFolderId === '' ? 'active' : ''} ${state.dragOverFolderId === '__root__' ? 'drag-hover' : ''}" data-action="filter-folder" data-folder-id="" data-folder-drop-target="true">
               <span class="folder-icon">🗂️</span>
               <div class="list-copy">
-                <div class="list-title">全部记录</div>
-                <div class="list-meta">${state.sessions.length} 条 session</div>
+                <div class="list-title">All Sessions</div>
+                <div class="list-meta">${state.sessions.length} sessions</div>
               </div>
             </button>
-            ${filteredFolders.length === 0 ? `<div class="muted" style="font-size:13px;padding:4px 6px;">暂无文件夹</div>` : filteredFolders.map(renderFolderItem).join('')}
+            ${filteredFolders.length === 0 ? `<div class="muted" style="font-size:13px;padding:4px 6px;">No folders yet</div>` : filteredFolders.map(renderFolderItem).join('')}
           </div>
         </section>
 
@@ -188,26 +207,44 @@ function renderSidebar() {
           <div class="sidebar-section-title">
             <span>Recent Sessions</span>
             <div class="section-actions">
-              <button class="text-btn" data-action="toggle-selection-mode">${state.selectionMode ? '完成' : '多选'}</button>
-              <button class="text-btn" data-action="refresh-data">刷新</button>
+              <button class="text-btn" data-action="toggle-selection-mode">${state.selectionMode ? 'Done' : 'Select'}</button>
+              <button class="text-btn" data-action="refresh-data">Refresh</button>
             </div>
           </div>
           ${renderBatchSessionActions()}
           <div class="list session-list">
-            ${filteredSessions.length === 0 ? `<div class="muted" style="font-size:13px;padding:4px 6px;">暂无符合条件的记录</div>` : filteredSessions.map(renderSessionItem).join('')}
+            ${filteredSessions.length === 0 ? `<div class="muted" style="font-size:13px;padding:4px 6px;">No matching sessions</div>` : filteredSessions.map(renderSessionItem).join('')}
           </div>
         </section>
       </div>
 
-      <div class="sidebar-footer">
-        <div class="avatar">JP</div>
-        <div class="list-copy">
-          <div class="list-title">User</div>
-          <div class="list-meta">System audio + mic toggle workflow</div>
-        </div>
-        <button class="icon-btn" data-action="toggle-sidebar" title="收起侧边栏">≡</button>
-      </div>
+      ${renderSidebarFooter()}
     </aside>
+  `;
+}
+
+
+function renderSidebarFooter() {
+  const account = getActiveAccount();
+  const displayName = account ? getAccountDisplayName(account) : 'Sign in';
+  const meta = account
+    ? (account.type === 'google' ? `Google · ${account.email || 'Connected'}` : (account.email || 'Email account'))
+    : 'Google / Email login';
+
+  return `
+    <div class="sidebar-footer">
+      <button class="account-chip" data-action="open-settings" title="Open settings">
+        ${renderAccountAvatar(account)}
+        <div class="list-copy">
+          <div class="list-title">${escapeHtml(displayName)}</div>
+          <div class="list-meta">${escapeHtml(meta)}</div>
+        </div>
+      </button>
+      <div class="sidebar-footer-actions">
+        <button class="icon-btn" data-action="open-settings" title="Settings">⚙</button>
+        <button class="icon-btn" data-action="toggle-sidebar" title="Collapse sidebar">≡</button>
+      </div>
+    </div>
   `;
 }
 
@@ -221,7 +258,7 @@ function renderFolderItem(folder) {
       <span class="list-item-dot" style="background:${escapeAttr(color)}"></span>
       <div class="list-copy">
         <div class="list-title">${escapeHtml(folder.name)}</div>
-        <div class="list-meta">${count} 条 session</div>
+        <div class="list-meta">${count} sessions</div>
       </div>
     </button>
   `;
@@ -252,11 +289,11 @@ function renderBackgroundRecordingBanner() {
   return `
     <div class="background-recording-banner">
       <div class="background-recording-copy">
-        <div class="background-recording-title">${viewingRecordedSession ? '当前 session 正在录制' : '后台录制进行中'}</div>
+        <div class="background-recording-title">${viewingRecordedSession ? 'This session is recording' : 'Background recording in progress'}</div>
         <div class="background-recording-meta">${sessionTitle} · system audio${state.micEnabled ? ' + mic' : ''}${state.screenEnabled ? ' + screenshots' : ''}</div>
       </div>
       <div class="background-recording-actions">
-        ${viewingRecordedSession ? '' : `<button class="ghost-btn small" data-action="jump-to-recording-session">回到录制页面</button>`}
+        ${viewingRecordedSession ? '' : `<button class="ghost-btn small" data-action="jump-to-recording-session">Open recording</button>`}
         <button class="danger-btn small" data-action="stop-recording">■ Stop</button>
       </div>
     </div>
@@ -268,37 +305,37 @@ function renderHome() {
     <section class="home-view">
       <div class="home-shell">
         <div class="home-hero">
-          <h1>开始新的记录</h1>
+          <h1>Start a new session</h1>
           <p>
-            这一版已经直接接上后端能力：Session / Folder 管理、WebSocket 实时转写、Meeting 说话人映射、Lecture 概念总结、AI Notes、Action Items、Q&A、导出和可选的 Drive 上传。
+            This build is already wired to the backend: session and folder management, live WebSocket transcription, meeting speaker mapping, lecture concept recaps, AI notes, action items, Q&A, export, and optional Google Drive upload.
           </p>
         </div>
 
         <div class="mode-grid">
           <article class="mode-card lecture">
             <div class="mode-badge lecture">🎓 Lecture Mode</div>
-            <h3>课堂 / 讲座模式</h3>
-            <p>重点面向课程、公开讲座、学习记录。界面会优先突出概念边界、结构化笔记和学生视角的 future-facing tasks。</p>
+            <h3>Lecture mode</h3>
+            <p>Built for classes, talks, and study sessions. The UI prioritizes concept boundaries, structured notes, and student-facing next steps.</p>
             <div class="feature-list">
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Concept recap 自动卡片</span></div>
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Cornell / 课程导向笔记生成</span></div>
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>作业 / quiz / reading 等待办抽取</span></div>
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>屏幕视觉上下文辅助理解板书 / Slides</span></div>
+              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Automatic concept recap cards</span></div>
+              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Cornell and class-oriented note generation</span></div>
+              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Homework, quiz, and reading task extraction</span></div>
+              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Screen context to interpret boards and slides</span></div>
             </div>
-            <button class="mode-cta lecture" data-action="create-session" data-mode="lecture">创建 Lecture Session →</button>
+            <button class="mode-cta lecture" data-action="create-session" data-mode="lecture">Create lecture session →</button>
           </article>
 
           <article class="mode-card meeting">
             <div class="mode-badge meeting">👥 Meeting Mode</div>
-            <h3>会议 / 团队模式</h3>
-            <p>重点面向 team sync、standup、需求讨论和复盘。界面会优先突出说话人、决策和 owner / deadline 风格的行动项。</p>
+            <h3>Meeting mode</h3>
+            <p>Built for team syncs, standups, planning, and retros. The UI prioritizes speakers, decisions, and owner or deadline style action items.</p>
             <div class="feature-list">
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Speaker diarization + 重命名</span></div>
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Meeting minutes 自动生成</span></div>
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Owner / deadline / deliverable 视角 action items</span></div>
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>跨 session / folder 语义问答</span></div>
+              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Speaker diarization and renaming</span></div>
+              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Automatic meeting minutes</span></div>
+              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Owner, deadline, and deliverable action items</span></div>
+              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Cross-session and cross-folder semantic Q&A</span></div>
             </div>
-            <button class="mode-cta meeting" data-action="create-session" data-mode="meeting">创建 Meeting Session →</button>
+            <button class="mode-cta meeting" data-action="create-session" data-mode="meeting">Create meeting session →</button>
           </article>
         </div>
       </div>
@@ -319,7 +356,7 @@ function renderWorkspace() {
     <section class="workspace">
       <header class="workspace-header">
         <div class="header-left">
-          <button class="icon-btn" data-action="back-home" title="返回主页">←</button>
+          <button class="icon-btn" data-action="back-home" title="Back home">←</button>
           <div class="title-wrap">
             <div class="header-meta">
               <span class="pill ${modeClass}">${escapeHtml(session.mode)}</span>
@@ -329,7 +366,7 @@ function renderWorkspace() {
             <textarea
               data-model="session-title"
               data-session-id="${session.id}"
-              placeholder="未命名记录"
+              placeholder="Untitled session"
               rows="1"
             >${escapeHtml(session.title || '')}</textarea>
           </div>
@@ -337,10 +374,10 @@ function renderWorkspace() {
 
         <div class="header-right">
           <div class="control-group">
-            <button class="toggle-btn ${state.micEnabled ? 'active' : ''}" data-action="toggle-mic" title="切换麦克风输入" aria-label="切换麦克风输入">
+            <button class="toggle-btn ${state.micEnabled ? 'active' : ''}" data-action="toggle-mic" title="Toggle microphone input" aria-label="Toggle microphone input">
               ${renderMicToggleIcon(state.micEnabled)}
             </button>
-            <button class="toggle-btn ${state.screenEnabled ? 'active screen' : ''}" data-action="toggle-screen" title="切换屏幕视觉分析" aria-label="切换屏幕视觉分析">
+            <button class="toggle-btn ${state.screenEnabled ? 'active screen' : ''}" data-action="toggle-screen" title="Toggle screen analysis" aria-label="Toggle screen analysis">
               ${renderScreenToggleIcon()}
             </button>
           </div>
@@ -354,15 +391,15 @@ function renderWorkspace() {
           ` : ''}
 
           ${session.status === 'completed' ? `
-            <button class="secondary-btn" data-action="open-export">⬇ 导出</button>
+            <button class="secondary-btn" data-action="open-export">⬇ Export</button>
           ` : ''}
         </div>
       </header>
 
       ${state.screenEnabled && isSessionActivelyRecording(session.id) ? `
         <div class="screen-banner">
-          <div>🖥️ 屏幕视觉分析已开启。系统会基于共享画面定时抓帧，并把截图分析结果注入右侧 AI 面板。</div>
-          <div><strong>${state.screenCaptures.length}</strong> 张已分析</div>
+          <div>🖥️ Screen analysis is on. The app will capture frames from the shared screen and inject the results into the AI panel.</div>
+          <div><strong>${state.screenCaptures.length}</strong> analyzed</div>
         </div>
       ` : ''}
 
@@ -370,10 +407,10 @@ function renderWorkspace() {
         <section class="transcript-panel">
           <div class="panel-header">
             <div>
-              <div class="panel-title"><span class="panel-icon">📝</span><span>实时转写</span></div>
-              <div class="panel-subtitle">System audio 默认为主输入；Mic 可随时开关。${session.mode === 'meeting' ? 'Meeting 模式下会启用说话人分离。' : 'Lecture 模式下会保留概念脉络。'}</div>
+              <div class="panel-title"><span class="panel-icon">📝</span><span>Live transcript</span></div>
+              <div class="panel-subtitle">System audio is the primary input and the mic can be toggled at any time.${session.mode === 'meeting' ? ' Speaker diarization is enabled in meeting mode.' : ' Concept flow is preserved in lecture mode.'}</div>
             </div>
-            ${session.mode === 'meeting' ? `<button class="text-btn" data-action="open-speakers">管理说话人</button>` : ''}
+            ${session.mode === 'meeting' ? `<button class="text-btn" data-action="open-speakers">Manage speakers</button>` : ''}
           </div>
 
           <div class="transcript-scroll" data-transcript-scroll>
@@ -383,10 +420,10 @@ function renderWorkspace() {
 
         <section class="insight-panel">
           <div class="tab-row">
-            ${renderTabButton('notes', '📄', 'AI 笔记')}
-            ${renderTabButton('action_items', '✅', '待办事项', tabBadge > 0 ? String(tabBadge) : '')}
-            ${session.mode === 'lecture' ? renderTabButton('recaps', '💡', '概念总结') : ''}
-            ${renderTabButton('qa', '💬', '会话问答')}
+            ${renderTabButton('notes', '📄', 'AI Notes')}
+            ${renderTabButton('action_items', '✅', 'Action Items', tabBadge > 0 ? String(tabBadge) : '')}
+            ${session.mode === 'lecture' ? renderTabButton('recaps', '💡', 'Concept Recaps') : ''}
+            ${renderTabButton('qa', '💬', 'Session Q&A')}
           </div>
           <div class="insight-scroll">
             ${renderInsightBody()}
@@ -399,7 +436,7 @@ function renderWorkspace() {
 
 function renderTranscriptBody() {
   if (state.loadingSession) {
-    return `<div class="empty-state"><div class="empty-state-card"><div class="spinner" style="margin:0 auto 12px"></div><div>正在加载 session 数据…</div></div></div>`;
+    return `<div class="empty-state"><div class="empty-state-card"><div class="spinner" style="margin:0 auto 12px"></div><div>Loading session data…</div></div></div>`;
   }
 
   if (!state.currentTranscript.length && !state.partialTranscript) {
@@ -407,8 +444,8 @@ function renderTranscriptBody() {
       <div class="empty-state">
         <div class="empty-state-card">
           <div class="empty-emoji">🎙️</div>
-          <div style="font-weight:700;margin-bottom:8px;">点击 Start 开始实时转写</div>
-          <div class="muted">录制时会默认请求系统音频共享；麦克风是可选增强输入，不再和 system audio 互斥。</div>
+          <div style="font-weight:700;margin-bottom:8px;">Click Start to begin live transcription</div>
+          <div class="muted">Recording requests system audio by default. The microphone is now an optional enhancement and is no longer mutually exclusive with system audio.</div>
         </div>
       </div>
     `;
@@ -434,11 +471,11 @@ function renderTranscriptBody() {
           <div class="transcript-time">${formatDuration(line.capture_time || line.start_time || 0)}</div>
           <div class="screen-card-inner">
             <div class="screen-card-head">
-              <div class="screen-card-title">视觉上下文</div>
-              ${canExpand ? `<button class="screen-readmore" data-action="toggle-screen-capture" data-capture-id="${escapeAttr(captureId)}">${expanded ? '收起' : 'Read more'}</button>` : ''}
+              <div class="screen-card-title">Visual context</div>
+              ${canExpand ? `<button class="screen-readmore" data-action="toggle-screen-capture" data-capture-id="${escapeAttr(captureId)}">${expanded ? 'Collapse' : 'Read more'}</button>` : ''}
             </div>
             <div class="screen-card-text ${expanded ? 'expanded' : 'collapsed'}">${escapeHtml(expanded ? rawDesc : shortDesc)}</div>
-            ${rawOcr ? `<div class="screen-card-subline">OCR：${escapeHtml(expanded ? rawOcr : shortOcr)}</div>` : ''}
+            ${rawOcr ? `<div class="screen-card-subline">OCR: ${escapeHtml(expanded ? rawOcr : shortOcr)}</div>` : ''}
           </div>
         </div>
       `;
@@ -468,10 +505,10 @@ function renderTranscriptBody() {
   const previewBanner = hiddenCount > 0 ? `
     <div class="transcript-truncation-card">
       <div>
-        <strong>已先展示最近 ${transcriptItems.length} 条内容</strong>
-        <div class="muted" style="margin-top:4px;">这个 session 较长。先渲染最近内容，避免页面卡死；需要时再展开完整 transcript。</div>
+        <strong>Showing the latest ${transcriptItems.length} entries first</strong>
+        <div class="muted" style="margin-top:4px;">This session is long. The latest content is rendered first to keep the page responsive. Expand to load the full transcript when needed.</div>
       </div>
-      <button class="ghost-btn small" data-action="toggle-full-transcript">${state.transcriptExpanded ? '收起' : '显示全部'}</button>
+      <button class="ghost-btn small" data-action="toggle-full-transcript">${state.transcriptExpanded ? 'Collapse' : 'Show all'}</button>
     </div>
   ` : '';
 
@@ -496,7 +533,7 @@ function renderInsightBody() {
 }
 
 function renderNotesTab() {
-  const progress = renderProgressPanel('notes', 'AI 笔记生成状态');
+  const progress = renderProgressPanel('notes', 'AI notes status');
 
   if (!state.currentNote) {
     return `
@@ -505,16 +542,16 @@ function renderNotesTab() {
         <div class="note-toolbar">
           <div>
             <div class="note-toolbar-title">${state.currentSession?.mode === 'meeting' ? 'Meeting Minutes' : 'AI Notes'}</div>
-            <div class="muted" style="font-size:13px;margin-top:4px;">AI 笔记改为手动生成；可以先选方式再触发。</div>
+            <div class="muted" style="font-size:13px;margin-top:4px;">AI notes are manual now. Choose a note style first, then generate them.</div>
           </div>
           <div class="note-toolbar-actions">
             ${renderNoteMethodPicker()}
-            <button class="primary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>生成 AI 笔记</button>
+            <button class="primary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>Generate AI notes</button>
           </div>
         </div>
         <div class="info-callout">
           <div>ℹ️</div>
-          <div>当前 session 还没有生成好的 AI 笔记。为节省 token，停止录制后不会再自动生成；已有 transcript 时可手动触发。</div>
+          <div>No AI notes have been generated for this session yet. To save tokens, notes are no longer auto-generated when recording stops. Generate them manually once a transcript exists.</div>
         </div>
       </div>
     `;
@@ -526,11 +563,11 @@ function renderNotesTab() {
       <div class="note-toolbar">
         <div>
           <div class="note-toolbar-title">${state.currentSession?.mode === 'meeting' ? 'Meeting Minutes' : 'AI Notes'}</div>
-          <div class="muted" style="font-size:13px;margin-top:4px;">当前方法：${escapeHtml(getNoteMethodLabel(state.currentNote.method || state.selectedNoteMethod || 'default'))}</div>
+          <div class="muted" style="font-size:13px;margin-top:4px;">Current method: ${escapeHtml(getNoteMethodLabel(state.currentNote.method || state.selectedNoteMethod || 'default'))}</div>
         </div>
         <div class="note-toolbar-actions">
           ${renderNoteMethodPicker()}
-          <button class="secondary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>重新生成</button>
+          <button class="secondary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>Regenerate</button>
         </div>
       </div>
       <div class="note-markdown">${markdownToHtml(state.currentNote.content || '')}</div>
@@ -542,7 +579,7 @@ function renderNoteMethodPicker() {
   const methods = state.noteMethods || [];
   if (!methods.length) return '';
   return `
-    <div class="note-method-picker" role="tablist" aria-label="选择笔记方式">
+    <div class="note-method-picker" role="tablist" aria-label="Choose note style">
       ${methods.map((method) => {
         const active = state.selectedNoteMethod === method.id;
         const shortName = method.name.replace(/\s*Method$/i, '').replace(/\s*Minutes$/i, '');
@@ -557,7 +594,7 @@ function renderNoteMethodPicker() {
 }
 
 function renderActionItemsTab() {
-  const progress = renderProgressPanel('action_items', 'Action Items 提取状态');
+  const progress = renderProgressPanel('action_items', 'Action items status');
 
   if (!state.currentNote || !Object.prototype.hasOwnProperty.call(state.currentNote, 'action_items')) {
     return `
@@ -565,9 +602,9 @@ function renderActionItemsTab() {
       <div class="note-body">
         <div class="info-callout">
           <div>💡</div>
-          <div>Action items 会从 transcript + 视觉上下文里独立抽取，优先保留 future-facing task / deadline / owner / reminder 类信息。</div>
+          <div>Action items are extracted separately from the transcript and visual context, with priority on future-facing tasks, deadlines, owners, and reminders.</div>
         </div>
-        <button class="primary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>提取待办事项</button>
+        <button class="primary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>Extract action items</button>
       </div>
     `;
   }
@@ -579,10 +616,10 @@ function renderActionItemsTab() {
     <div class="note-body">
       <div class="info-callout">
         <div>🧠</div>
-        <div>这些待办来自真实后端抽取，不是前端 mock。Meeting 更偏 owner / deliverable；Lecture 更偏作业 / 考试 / reading / reminders。</div>
+        <div>These action items come from the real backend, not a frontend mock. Meeting mode emphasizes owners and deliverables; lecture mode emphasizes homework, quizzes, readings, and reminders.</div>
       </div>
       <div class="action-list">
-        ${items.length ? items.map(renderActionItem).join('') : `<div class="muted">没有识别出明确 action item。</div>`}
+        ${items.length ? items.map(renderActionItem).join('') : `<div class="muted">No clear action items were detected.</div>`}
       </div>
     </div>
   `;
@@ -595,7 +632,7 @@ function renderActionItem(item, index) {
   const owner = extractOwner(item);
   if (deadline) chips.push(`<span class="chip red">Deadline: ${escapeHtml(deadline)}</span>`);
   if (owner) chips.push(`<span class="chip gray">Owner: ${escapeHtml(owner)}</span>`);
-  if (!deadline && state.currentSession?.mode === 'lecture') chips.push(`<span class="chip blue">学生 Action</span>`);
+  if (!deadline && state.currentSession?.mode === 'lecture') chips.push(`<span class="chip blue">Student action</span>`);
   return `
     <label class="action-card">
       <input type="checkbox" data-action="noop" />
@@ -609,7 +646,7 @@ function renderActionItem(item, index) {
 
 function renderRecapsTab() {
   const recaps = (state.currentSummaries || []).filter((summary) => summary.summary_type === 'concept');
-  const progress = renderProgressPanel('recaps', 'Concept Recap 生成状态');
+  const progress = renderProgressPanel('recaps', 'Concept recap status');
 
   if (!recaps.length) {
     return `
@@ -617,9 +654,9 @@ function renderRecapsTab() {
       <div class="note-body">
         <div class="info-callout">
           <div>💡</div>
-          <div>概念总结来自后端的 concept boundary 检测。如果当前 lecture 还没累计到足够上下文，可以在录制一段后再看，或者手动触发一次 recap。</div>
+          <div>Concept recaps come from backend concept-boundary detection. If the lecture has not accumulated enough context yet, record a bit longer or trigger a recap manually.</div>
         </div>
-        <button class="primary-btn" data-action="generate-recap" ${isProgressActive('recaps') ? 'disabled' : ''}>生成 Concept Recap</button>
+        <button class="primary-btn" data-action="generate-recap" ${isProgressActive('recaps') ? 'disabled' : ''}>Generate concept recap</button>
       </div>
     `;
   }
@@ -627,14 +664,14 @@ function renderRecapsTab() {
   return `
     ${progress}
     <div class="recaps-grid">
-      <button class="secondary-btn" style="width:max-content" data-action="generate-recap" ${isProgressActive('recaps') ? 'disabled' : ''}>+ 继续检测新概念</button>
+      <button class="secondary-btn" style="width:max-content" data-action="generate-recap" ${isProgressActive('recaps') ? 'disabled' : ''}>+ Detect more concepts</button>
       ${recaps.map((recap) => `
         <article class="recap-card">
           <div class="recap-head">
             <div class="recap-title">📘 ${escapeHtml(recap.topic_label || 'Concept')}</div>
             <div class="recap-meta">${formatDuration(recap.start_time || 0)} → ${formatDuration(recap.end_time || 0)}</div>
           </div>
-          <div class="recap-body note-markdown">${markdownToHtml(recap.summary_text || '')}</div>
+          <div class="recap-body note-markdown">${markdownToHtml(recap.content || recap.summary || '')}</div>
         </article>
       `).join('')}
     </div>
@@ -642,7 +679,7 @@ function renderRecapsTab() {
 }
 
 function renderQATab() {
-  const progress = renderProgressPanel('qa', '会话问答生成状态');
+  const progress = renderProgressPanel('qa', 'Session Q&A status');
   return `
     <div>
       ${progress}
@@ -650,7 +687,7 @@ function renderQATab() {
         ${state.qaMessages.length ? state.qaMessages.map(renderChatMessage).join('') : `
           <div class="chat-row assistant">
             <div class="chat-bubble">
-              你好！这里已经接上真实后端问答接口。你可以问当前 session，也可以在有 folder 的情况下自动跨 session 检索。
+              Hi! The live backend Q&A endpoint is already connected. Ask about the current session, or search across sessions automatically when a folder is selected.
             </div>
           </div>
         `}
@@ -658,9 +695,9 @@ function renderQATab() {
 
       <div class="qa-compose">
         <form class="qa-form" data-action="ask-question-form">
-          <textarea data-model="qaInput" placeholder="例如：这次会议最后决定什么时候发 Beta？或者：这节课监督学习和无监督学习的区别是什么？">${escapeHtml(state.qaInput)}</textarea>
+          <textarea data-model="qaInput" placeholder="For example: When did the team decide to ship beta? Or: What is the difference between supervised and unsupervised learning in this lecture?">${escapeHtml(state.qaInput)}</textarea>
           <button class="primary-btn" type="submit" ${state.askingQuestion ? 'disabled' : ''}>
-            ${state.askingQuestion ? '思考中…' : '发送'}
+            ${state.askingQuestion ? 'Thinking…' : 'Send'}
           </button>
         </form>
       </div>
@@ -695,52 +732,53 @@ function renderExportModal() {
       <div class="modal" data-modal-card="true">
         <div class="modal-head">
           <div>
-            <div class="modal-title">导出记录</div>
-            <div class="muted" style="margin-top:6px;font-size:13px;">支持本地下载，也支持浏览器侧直传 Google Drive。</div>
+            <div class="modal-title">Export session</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Download locally, or upload directly to Google Drive when the active account is signed in with Google.</div>
           </div>
           <button class="icon-btn" data-action="close-export" ${state.exportBusy ? 'disabled' : ''}>×</button>
         </div>
         <div class="modal-body">
           <div class="field-group">
-            <div class="field-label">1. 选择格式</div>
+            <div class="field-label">1. Choose a format</div>
             <div class="option-grid">
               <button type="button" class="export-option ${state.exportFormat === 'pdf' ? 'selected' : ''}" data-action="pick-export-format" data-format="pdf" ${state.exportBusy ? 'disabled' : ''}>
                 <div>📄</div>
                 <div class="option-title">PDF</div>
-                <div class="option-desc">适合阅读、分享、归档</div>
+                <div class="option-desc">Best for reading, sharing, and archiving</div>
               </button>
               <button type="button" class="export-option ${state.exportFormat === 'docx' ? 'selected' : ''}" data-action="pick-export-format" data-format="docx" ${state.exportBusy ? 'disabled' : ''}>
                 <div>📝</div>
                 <div class="option-title">DOCX</div>
-                <div class="option-desc">适合后续编辑和改写</div>
+                <div class="option-desc">Best for editing later</div>
               </button>
             </div>
           </div>
 
           <div class="field-group">
-            <div class="field-label">2. 选择去向</div>
+            <div class="field-label">2. Choose a destination</div>
             <div class="option-grid">
               <button type="button" class="export-option ${state.exportDestination === 'download' ? 'selected' : ''}" data-action="pick-export-destination" data-destination="download" ${state.exportBusy ? 'disabled' : ''}>
                 <div>⬇</div>
-                <div class="option-title">下载到本地</div>
-                <div class="option-desc">直接从后端导出并下载</div>
+                <div class="option-title">Download locally</div>
+                <div class="option-desc">Export from the backend and download it</div>
               </button>
               <button type="button" class="export-option ${state.exportDestination === 'drive' ? 'selected' : ''}" data-action="pick-export-destination" data-destination="drive" ${state.exportBusy ? 'disabled' : ''}>
                 <div>☁️</div>
-                <div class="option-title">上传 Google Drive</div>
-                <div class="option-desc">使用前端 OAuth + Drive File API</div>
+                <div class="option-title">Upload to Google Drive</div>
+                <div class="option-desc">${escapeHtml(getDriveExportDescription())}</div>
               </button>
             </div>
           </div>
+          ${!canUseDriveExport() ? `<div class="inline-alert">You are not currently signed in with Google, so Google Drive export is unavailable. Add or switch to a Google account in Settings first.</div>` : ''}
           ${state.exportBusy ? `<div class="progress-panel inline">
-            <div class="progress-head"><div class="progress-title">正在导出</div><div class="progress-status running">Working</div></div>
+            <div class="progress-head"><div class="progress-title">Exporting</div><div class="progress-status running">Working</div></div>
             <div class="progress-bar"><div class="progress-fill active" style="width:82%"></div></div>
-            <div class="progress-caption">正在准备文件并执行 ${state.exportDestination === 'drive' ? 'Google Drive 上传' : '本地下载'}。</div>
+            <div class="progress-caption">Preparing the file and running ${state.exportDestination === 'drive' ? 'Google Drive upload' : 'local download'}.</div>
           </div>` : ''}
         </div>
         <div class="modal-foot">
-          <button class="ghost-btn" data-action="close-export" ${state.exportBusy ? 'disabled' : ''}>取消</button>
-          <button class="primary-btn" data-action="confirm-export" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? '导出中…' : '确认导出'}</button>
+          <button class="ghost-btn" data-action="close-export" ${state.exportBusy ? 'disabled' : ''}>Cancel</button>
+          <button class="primary-btn" data-action="confirm-export" ${state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? 'Exporting…' : 'Export'}</button>
         </div>
       </div>
     </div>
@@ -754,8 +792,8 @@ function renderSpeakerModal() {
       <div class="modal" onclick="event.stopPropagation()">
         <div class="modal-head">
           <div>
-            <div class="modal-title">说话人映射</div>
-            <div class="muted" style="margin-top:6px;font-size:13px;">修改后会写回后端，并同步更新后续 transcript label。</div>
+            <div class="modal-title">Speaker mapping</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Changes will be written back to the backend and used for later transcript labels.</div>
           </div>
           <button class="icon-btn" data-action="close-speakers">×</button>
         </div>
@@ -765,11 +803,11 @@ function renderSpeakerModal() {
               <div class="speaker-avatar ${speakerClassName(key)}">${escapeHtml(shortSpeakerKey(key))}</div>
               <input class="text-input" data-speaker-key="${key}" value="${escapeAttr(state.speakerMap[key] || key)}" />
             </div>
-          `).join('') : `<div class="muted">当前还没有识别到 speaker。Meeting 模式开始录制后会自动生成。</div>`}
+          `).join('') : `<div class="muted">No speakers have been detected yet. They will appear automatically after recording starts in meeting mode.</div>`}
         </div>
         <div class="modal-foot">
-          <button class="ghost-btn" data-action="close-speakers">取消</button>
-          <button class="primary-btn" data-action="save-speakers">保存映射</button>
+          <button class="ghost-btn" data-action="close-speakers">Cancel</button>
+          <button class="primary-btn" data-action="save-speakers">Save mapping</button>
         </div>
       </div>
     </div>
@@ -780,14 +818,36 @@ function renderToast() {
   return `<div class="toast ${state.toast.type === 'error' ? 'error' : ''}">${escapeHtml(state.toast.message)}</div>`;
 }
 
+function renderConfirmModal() {
+  const dialog = state.confirmDialog;
+  if (!dialog) return '';
+  return `
+    <div class="modal-layer" data-action="close-confirm-layer">
+      <div class="modal confirm-modal" data-modal-card="true">
+        <div class="modal-head">
+          <div>
+            <div class="modal-title">${escapeHtml(dialog.title || 'Confirm action')}</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">${escapeHtml(dialog.message || 'Are you sure you want to continue?')}</div>
+          </div>
+          <button class="icon-btn" data-action="close-confirm">×</button>
+        </div>
+        <div class="modal-foot">
+          <button class="ghost-btn" data-action="close-confirm">${escapeHtml(dialog.cancelLabel || 'Cancel')}</button>
+          <button class="${dialog.tone === 'danger' ? 'danger-btn' : 'primary-btn'}" data-action="confirm-dialog-confirm">${escapeHtml(dialog.confirmLabel || 'Confirm')}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderBatchSessionActions() {
   if (!state.selectionMode) return '';
   return `
     <div class="batch-bar ${state.selectedSessionIds.length ? 'active' : ''}">
-      <div class="batch-copy">已选择 ${state.selectedSessionIds.length} 个 session</div>
+      <div class="batch-copy">Selected ${state.selectedSessionIds.length} sessions</div>
       <div class="batch-actions">
-        <button class="ghost-btn small" data-action="open-move-modal" ${state.selectedSessionIds.length ? '' : 'disabled'}>移动</button>
-        <button class="ghost-btn small danger-lite" data-action="delete-selected-sessions" ${state.selectedSessionIds.length ? '' : 'disabled'}>删除</button>
+        <button class="ghost-btn small" data-action="open-move-modal" ${state.selectedSessionIds.length ? '' : 'disabled'}>Move</button>
+        <button class="ghost-btn small danger-lite" data-action="delete-selected-sessions" ${state.selectedSessionIds.length ? '' : 'disabled'}>Delete</button>
       </div>
     </div>
   `;
@@ -814,24 +874,24 @@ function renderFolderModal() {
       <div class="modal folder-modal" data-modal-card="true">
         <div class="modal-head">
           <div>
-            <div class="modal-title">新建 Folder</div>
-            <div class="muted" style="margin-top:6px;font-size:13px;">给 folder 一个更明确的名字和颜色，后面拖拽或批量移动 session 会更顺手。</div>
+            <div class="modal-title">New folder</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Give the folder a clearer name and color so drag-and-drop and bulk move actions are easier later.</div>
           </div>
           <button class="icon-btn" data-action="close-folder-modal">×</button>
         </div>
         <div class="modal-body custom-scrollbar">
           <div class="field-group">
-            <div class="field-label">Folder 名称</div>
-            <input class="text-input" data-model="folder-name" value="${escapeAttr(state.folderDraft.name || '')}" placeholder="例如：UCI Lectures / Product Weekly / Interview Prep" />
+            <div class="field-label">Folder name</div>
+            <input class="text-input" data-model="folder-name" value="${escapeAttr(state.folderDraft.name || '')}" placeholder="For example: UCI Lectures / Product Weekly / Interview Prep" />
           </div>
           <div class="field-group">
-            <div class="field-label">建议名称</div>
+            <div class="field-label">Suggested names</div>
             <div class="suggestion-row">
               ${suggestions.map((name) => `<button class="suggestion-chip" data-action="use-folder-suggestion" data-folder-name="${escapeAttr(name)}">${escapeHtml(name)}</button>`).join('')}
             </div>
           </div>
           <div class="field-group">
-            <div class="field-label">颜色</div>
+            <div class="field-label">Color</div>
             <div class="color-row">
               ${getFolderColorOptions().map((color) => `<button class="color-swatch ${state.folderDraft.color === color ? 'active' : ''}" data-action="set-folder-color" data-color="${escapeAttr(color)}" style="--swatch:${escapeAttr(color)}"></button>`).join('')}
             </div>
@@ -840,13 +900,13 @@ function renderFolderModal() {
             <span class="list-item-dot" style="background:${escapeAttr(state.folderDraft.color || '#2962ff')}"></span>
             <div>
               <div class="folder-preview-title">${escapeHtml((state.folderDraft.name || 'New Folder').trim() || 'New Folder')}</div>
-              <div class="folder-preview-meta">预览你的 folder 样式</div>
+              <div class="folder-preview-meta">Folder preview</div>
             </div>
           </div>
         </div>
         <div class="modal-foot">
-          <button class="ghost-btn" data-action="close-folder-modal">取消</button>
-          <button class="primary-btn" data-action="save-folder">创建 Folder</button>
+          <button class="ghost-btn" data-action="close-folder-modal">Cancel</button>
+          <button class="primary-btn" data-action="save-folder">Create folder</button>
         </div>
       </div>
     </div>
@@ -854,39 +914,171 @@ function renderFolderModal() {
 }
 
 function renderMoveModal() {
-  const targetIds = state.moveSessionIds || [];
-  const selectedCount = targetIds.length;
+  const selectedCount = state.moveSessionIds.length;
   return `
     <div class="modal-layer" data-action="close-move-modal-layer">
       <div class="modal" data-modal-card="true">
         <div class="modal-head">
           <div>
-            <div class="modal-title">移动 Session</div>
-            <div class="muted" style="margin-top:6px;font-size:13px;">把 ${selectedCount} 个 session 移到指定 folder，也可以拖拽单个 session 到左侧 folder。</div>
+            <div class="modal-title">Move sessions</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Move ${selectedCount} session${selectedCount === 1 ? '' : 's'} to a folder, or drag a single session into a folder from the sidebar.</div>
           </div>
           <button class="icon-btn" data-action="close-move-modal">×</button>
         </div>
-        <div class="modal-body custom-scrollbar">
+        <div class="modal-body">
           <div class="move-list">
             <button class="move-option ${state.moveTargetFolderId === '' ? 'active' : ''}" data-action="pick-move-target" data-folder-id="">
               <span class="folder-icon">🗂️</span>
               <div class="list-copy">
-                <div class="list-title">全部记录 / 不放入 folder</div>
-                <div class="list-meta">移出任何 folder</div>
+                <div class="list-title">All sessions / no folder</div>
+                <div class="list-meta">Remove from any folder</div>
               </div>
             </button>
-            ${state.folders.map((folder) => `<button class="move-option ${state.moveTargetFolderId === folder.id ? 'active' : ''}" data-action="pick-move-target" data-folder-id="${folder.id}">
-              <span class="list-item-dot" style="background:${escapeAttr(folder.color || '#7c3aed')}"></span>
-              <div class="list-copy">
-                <div class="list-title">${escapeHtml(folder.name)}</div>
-                <div class="list-meta">${state.sessions.filter((s) => s.folder_id === folder.id).length} 条 session</div>
-              </div>
-            </button>`).join('')}
+            ${state.folders.map((folder) => `
+              <button class="move-option ${state.moveTargetFolderId === folder.id ? 'active' : ''}" data-action="pick-move-target" data-folder-id="${folder.id}">
+                <span class="list-item-dot" style="background:${escapeAttr(folder.color || '#2962ff')}"></span>
+                <div class="list-copy">
+                  <div class="list-title">${escapeHtml(folder.name)}</div>
+                  <div class="list-meta">${state.sessions.filter((s) => s.folder_id === folder.id).length} sessions</div>
+                </div>
+              </button>
+            `).join('')}
           </div>
         </div>
         <div class="modal-foot">
-          <button class="ghost-btn" data-action="close-move-modal">取消</button>
-          <button class="primary-btn" data-action="confirm-move-sessions">确认移动</button>
+          <button class="ghost-btn" data-action="close-move-modal">Cancel</button>
+          <button class="primary-btn" data-action="confirm-move-sessions">Move</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+
+function renderSettingsModal() {
+  const activeAccount = getActiveAccount();
+  const plans = [
+    { id: 'free', name: 'Free', meta: 'Current default', desc: 'Keeps the current core recording, transcription, and export features.' },
+    { id: 'pro', name: 'Pro', meta: 'Coming soon', desc: 'Can later add higher limits, more AI workflows, and cross-device sync.' },
+    { id: 'team', name: 'Team', meta: 'Coming soon', desc: 'Can later add collaboration, shared spaces, and org-level controls.' },
+  ];
+
+  return `
+    <div class="modal-layer" data-action="close-settings-layer">
+      <div class="modal settings-modal" data-modal-card="true">
+        <div class="modal-head">
+          <div>
+            <div class="modal-title">Settings</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Manage accounts, plan, and theme here.</div>
+          </div>
+          <button class="icon-btn" data-action="close-settings">×</button>
+        </div>
+        <div class="modal-body custom-scrollbar settings-body">
+          <section class="settings-section">
+            <div class="settings-section-head">
+              <div>
+                <div class="settings-section-title">Accounts</div>
+                <div class="muted">Use either a Google account or an email account. The active account also determines whether direct Google Drive export is available.</div>
+              </div>
+              ${activeAccount ? `<div class="active-account-pill">Current · ${escapeHtml(getAccountDisplayName(activeAccount))}</div>` : ''}
+            </div>
+
+            <div class="settings-account-list">
+              ${state.accounts.length ? state.accounts.map((account) => {
+                const active = account.id === state.activeAccountId;
+                const canDirectDrive = account.type === 'google';
+                const secondary = account.email || (account.type === 'google' ? 'Google account' : 'Email account');
+                return `
+                  <div class="settings-account-card ${active ? 'active' : ''}">
+                    <div class="settings-account-main">
+                      ${renderAccountAvatar(account)}
+                      <div class="list-copy">
+                        <div class="list-title">${escapeHtml(getAccountDisplayName(account))}</div>
+                        <div class="list-meta" title="${escapeAttr(secondary)}">${escapeHtml(secondary)}</div>
+                        <div class="settings-account-tags">
+                          <span class="mini-chip">${account.type === 'google' ? 'Google' : 'Email'}</span>
+                          <span class="mini-chip ${canDirectDrive ? 'success' : ''}">${canDirectDrive ? 'Drive ready' : 'Local export only'}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="settings-account-actions">
+                      ${active ? `<span class="mini-chip solid">Active</span>` : `<button class="ghost-btn small" data-action="switch-account" data-account-id="${escapeAttr(account.id)}">Switch</button>`}
+                      <button class="ghost-btn small" data-action="remove-account" data-account-id="${escapeAttr(account.id)}">Remove</button>
+                    </div>
+                  </div>
+                `;
+              }).join('') : `<div class="empty-state-box">No accounts yet. Add a Google account or create an email account to get started.</div>`}
+            </div>
+
+            <div class="settings-actions-row">
+              <button class="secondary-btn" data-action="add-google-account" ${state.authBusy ? 'disabled' : ''}>${state.authBusy ? 'Connecting…' : 'Continue with Google'}</button>
+            </div>
+
+            <form class="email-account-form" data-action="add-email-account-form">
+              <div class="field-row two-col">
+                <div class="field-group">
+                  <div class="field-label">First name</div>
+                  <input class="text-input" data-model="email-first-name" value="${escapeAttr(state.emailAccountDraft.firstName || '')}" placeholder="Paul" />
+                </div>
+                <div class="field-group">
+                  <div class="field-label">Last name</div>
+                  <input class="text-input" data-model="email-last-name" value="${escapeAttr(state.emailAccountDraft.lastName || '')}" placeholder="Jiang" />
+                </div>
+              </div>
+              <div class="field-group" style="margin-bottom:0;">
+                <div class="field-label">Email</div>
+                <input class="text-input" data-model="email-address" value="${escapeAttr(state.emailAccountDraft.email || '')}" placeholder="you@example.com" />
+              </div>
+              <div class="email-form-foot">
+                <div class="muted">With email login, the avatar uses the first letter of the first name plus the last letter of the last name by default.</div>
+                <button class="primary-btn" type="submit">Add email account</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="settings-section">
+            <div class="settings-section-head">
+              <div>
+                <div class="settings-section-title">Plan</div>
+                <div class="muted">This version includes a presentational plan panel. Payment can be connected later.</div>
+              </div>
+            </div>
+            <div class="plan-grid">
+              ${plans.map((plan) => `
+                <div class="plan-card ${plan.id === 'free' ? 'active' : ''}">
+                  <div class="plan-head">
+                    <div class="plan-name">${plan.name}</div>
+                    <div class="mini-chip ${plan.id === 'free' ? 'solid' : ''}">${plan.meta}</div>
+                  </div>
+                  <div class="plan-desc">${plan.desc}</div>
+                </div>
+              `).join('')}
+            </div>
+          </section>
+
+          <section class="settings-section">
+            <div class="settings-section-head">
+              <div>
+                <div class="settings-section-title">Theme</div>
+                <div class="muted">Light and dark themes are available. Light remains the default.</div>
+              </div>
+            </div>
+            <div class="option-grid theme-grid">
+              <button type="button" class="export-option ${state.theme === 'light' ? 'selected' : ''}" data-action="pick-theme" data-theme="light">
+                <div>☀️</div>
+                <div class="option-title">Light</div>
+                <div class="option-desc">Current default theme</div>
+              </button>
+              <button type="button" class="export-option ${state.theme === 'dark' ? 'selected' : ''}" data-action="pick-theme" data-theme="dark">
+                <div>🌙</div>
+                <div class="option-title">Dark</div>
+                <div class="option-desc">Dark mode</div>
+              </button>
+            </div>
+          </section>
+        </div>
+        <div class="modal-foot">
+          <button class="primary-btn" data-action="close-settings">Done</button>
         </div>
       </div>
     </div>
@@ -1052,10 +1244,18 @@ async function handleClick(event) {
         state.exportFormat = actionEl.dataset.format || 'pdf';
         scheduleRender();
         break;
-      case 'pick-export-destination':
-        state.exportDestination = actionEl.dataset.destination || 'download';
+      case 'pick-export-destination': {
+        const destination = actionEl.dataset.destination || 'download';
+        if (destination === 'drive' && !canUseDriveExport()) {
+          state.exportDestination = 'download';
+          showToast('The active account is not a Google account, so direct Google Drive export is unavailable. Switch to a Google account in Settings first.', 'error');
+          scheduleRender();
+          break;
+        }
+        state.exportDestination = destination;
         scheduleRender();
         break;
+      }
       case 'close-export':
         if (state.exportBusy) break;
         state.showExportModal = false;
@@ -1066,15 +1266,50 @@ async function handleClick(event) {
         state.showExportModal = false;
         scheduleRender();
         break;
+      case 'open-settings':
+        state.showSettingsModal = true;
+        scheduleRender();
+        break;
+      case 'close-settings':
+        state.showSettingsModal = false;
+        scheduleRender();
+        break;
+      case 'close-settings-layer':
+        if (event.target !== actionEl) break;
+        state.showSettingsModal = false;
+        scheduleRender();
+        break;
+      case 'close-confirm':
+        resolveConfirmation(false);
+        break;
+      case 'close-confirm-layer':
+        if (event.target !== actionEl) break;
+        resolveConfirmation(false);
+        break;
+      case 'confirm-dialog-confirm':
+        resolveConfirmation(true);
+        break;
       case 'confirm-export':
         await handleExport();
+        break;
+      case 'add-google-account':
+        await addGoogleAccount();
+        break;
+      case 'switch-account':
+        switchActiveAccount(actionEl.dataset.accountId || '');
+        break;
+      case 'remove-account':
+        await removeAccount(actionEl.dataset.accountId || '');
+        break;
+      case 'pick-theme':
+        setTheme(actionEl.dataset.theme || 'light');
         break;
       default:
         break;
     }
   } catch (err) {
     console.error(err);
-    showToast(err.message || '操作失败，请重试。', 'error');
+    showToast(err.message || 'Action failed. Please try again.', 'error');
   }
 }
 
@@ -1108,6 +1343,24 @@ function handleInput(event) {
     return;
   }
 
+  if (model === 'email-first-name') {
+    state.emailAccountDraft.firstName = event.target.value;
+    scheduleRender();
+    return;
+  }
+
+  if (model === 'email-last-name') {
+    state.emailAccountDraft.lastName = event.target.value;
+    scheduleRender();
+    return;
+  }
+
+  if (model === 'email-address') {
+    state.emailAccountDraft.email = event.target.value;
+    scheduleRender();
+    return;
+  }
+
 }
 
 function handleChange(event) {
@@ -1116,9 +1369,15 @@ function handleChange(event) {
 
 async function handleSubmit(event) {
   const formAction = event.target.dataset.action;
-  if (formAction !== 'ask-question-form') return;
-  event.preventDefault();
-  await askQuestion();
+  if (formAction === 'ask-question-form') {
+    event.preventDefault();
+    await askQuestion();
+    return;
+  }
+  if (formAction === 'add-email-account-form') {
+    event.preventDefault();
+    await addEmailAccount();
+  }
 }
 
 async function refreshSidebarData() {
@@ -1163,7 +1422,7 @@ function syncSidebarRecordingState() {
   });
 }
 
-function withTimeout(promise, ms, fallbackMessage = '请求超时') {
+function withTimeout(promise, ms, fallbackMessage = 'Request timed out') {
   let timer = null;
   return Promise.race([
     promise.finally(() => {
@@ -1213,7 +1472,7 @@ async function createFolderFlow() {
   if (state.creatingFolder) return;
   const name = (state.folderDraft.name || '').trim();
   if (!name) {
-    showToast('请输入 folder 名称。', 'error');
+    showToast('Please enter a folder name.', 'error');
     return;
   }
   state.creatingFolder = true;
@@ -1226,7 +1485,7 @@ async function createFolderFlow() {
     state.activeFolderId = folder.id;
     state.showFolderModal = false;
     state.folderDraft = { name: '', color: '#2962ff' };
-    showToast('文件夹已创建。');
+    showToast('Folder created.');
   } finally {
     state.creatingFolder = false;
     scheduleRender();
@@ -1235,7 +1494,7 @@ async function createFolderFlow() {
 
 async function createSessionFlow(mode) {
   const payload = {
-    title: mode === 'lecture' ? '未命名课程记录' : '未命名会议记录',
+    title: mode === 'lecture' ? 'Untitled lecture session' : 'Untitled meeting session',
     mode,
     folder_id: state.activeFolderId || null,
   };
@@ -1249,7 +1508,7 @@ async function createSessionFlow(mode) {
     state.micEnabled = false;
     state.screenEnabled = false;
   }
-  showToast(`${mode === 'lecture' ? 'Lecture' : 'Meeting'} session 已创建。`);
+  showToast(`${mode === 'lecture' ? 'Lecture' : 'Meeting'} session  created.`);
 }
 
 async function openSession(sessionId, options = {}) {
@@ -1266,7 +1525,7 @@ async function openSession(sessionId, options = {}) {
   scheduleRender();
 
   try {
-    const session = await withTimeout(api(`/api/sessions/${sessionId}`), 12000, '加载 session 基本信息超时。');
+    const session = await withTimeout(api(`/api/sessions/${sessionId}`), 12000, 'Timed out while loading session details.');
     if (openToken !== latestOpenSessionToken) return;
 
     state.currentSession = applyRecordingStateToSession(session);
@@ -1285,12 +1544,12 @@ async function openSession(sessionId, options = {}) {
     scheduleRender();
 
     const [chunksResult, summariesResult, noteResult, speakersResult, screenCapturesResult, noteMethodsResult] = await Promise.allSettled([
-      withTimeout(api(`/api/sessions/${sessionId}/chunks`), 12000, '加载 transcript 超时。'),
-      withTimeout(api(`/api/sessions/${sessionId}/summaries`), 8000, '加载 summaries 超时。'),
-      withTimeout(api(`/api/sessions/${sessionId}/notes`).catch(() => null), 5000, '加载 notes 超时。'),
-      withTimeout(api(`/api/sessions/${sessionId}/speaker-map`).catch(() => ({})), 5000, '加载 speaker map 超时。'),
-      withTimeout(api(`/api/sessions/${sessionId}/screen-captures`).catch(() => ([])), 6000, '加载 screen captures 超时。'),
-      withTimeout(api(`/api/note-methods?mode=${encodeURIComponent(session?.mode || 'lecture')}`).catch(() => ([])), 4000, '加载 note methods 超时。'),
+      withTimeout(api(`/api/sessions/${sessionId}/chunks`), 12000, 'Timed out while loading the transcript.'),
+      withTimeout(api(`/api/sessions/${sessionId}/summaries`), 8000, 'Timed out while loading summaries.'),
+      withTimeout(api(`/api/sessions/${sessionId}/notes`).catch(() => null), 5000, 'Timed out while loading notes.'),
+      withTimeout(api(`/api/sessions/${sessionId}/speaker-map`).catch(() => ({})), 5000, 'Timed out while loading speaker mapping.'),
+      withTimeout(api(`/api/sessions/${sessionId}/screen-captures`).catch(() => ([])), 6000, 'Timed out while loading screen captures.'),
+      withTimeout(api(`/api/note-methods?mode=${encodeURIComponent(session?.mode || 'lecture')}`).catch(() => ([])), 4000, 'Timed out while loading note methods.'),
     ]);
 
     if (openToken !== latestOpenSessionToken) return;
@@ -1314,7 +1573,7 @@ async function openSession(sessionId, options = {}) {
     syncCurrentSessionWithRecordingCache();
 
     if (chunksResult.status !== 'fulfilled') {
-      showToast('这个旧 session 的 transcript 比较大，已先跳过阻塞加载；你仍然可以继续查看其他内容。', 'error');
+      showToast('This older session has a large transcript, so the blocking load was skipped first. You can still continue using the rest of the page.', 'error');
     }
   } finally {
     if (openToken === latestOpenSessionToken) {
@@ -1351,10 +1610,10 @@ async function toggleMic() {
   if (isAnyRecordingActive()) {
     if (next) {
       await attachMicStream();
-      showToast('麦克风输入已打开。');
+      showToast('Microphone input enabled.');
     } else {
       detachMicStream();
-      showToast('麦克风输入已关闭。');
+      showToast('Microphone input disabled.');
     }
   }
 }
@@ -1366,19 +1625,19 @@ async function toggleScreen() {
   if (isAnyRecordingActive()) {
     if (state.screenEnabled) {
       ensureScreenCaptureLoop();
-      showToast('屏幕视觉分析已开启。');
+      showToast('Screen analysis enabled.');
     } else {
       stopScreenCaptureLoop();
-      showToast('屏幕视觉分析已关闭。');
+      showToast('Screen analysis disabled.');
     }
   }
 }
 
 async function startRecording() {
   const session = state.currentSession;
-  if (!session) throw new Error('请先创建或打开一个 session。');
+  if (!session) throw new Error('Create or open a session first.');
   if (isAnyRecordingActive() && state.recording.sessionId !== session.id) {
-    throw new Error('已有另一个 session 在后台录制。请先停止后再开始新的录制。');
+    throw new Error('Another session is already recording in the background. Stop it before starting a new recording.');
   }
   if (isSessionActivelyRecording(session.id) || session.status === 'recording' || session.status === 'starting') return;
 
@@ -1396,7 +1655,7 @@ async function startRecording() {
     session.status = 'idle';
     clearRecordingSessionState();
     scheduleRender();
-    throw new Error('需要先授权共享屏幕/标签页，并勾选系统音频。');
+    throw new Error('Grant screen or tab sharing first and make sure system audio is enabled.');
   }
 
   if (!displayStream.getAudioTracks().length) {
@@ -1404,7 +1663,7 @@ async function startRecording() {
     session.status = 'idle';
     clearRecordingSessionState();
     scheduleRender();
-    throw new Error('当前共享源没有系统音频。请重新选择支持“Share tab audio / 系统音频”的来源。');
+    throw new Error('The current shared source does not include system audio. Re-select a source that supports shared tab or system audio.');
   }
 
   state.recording.displayStream = displayStream;
@@ -1418,7 +1677,7 @@ async function startRecording() {
   if (videoTrack) {
     videoTrack.addEventListener('ended', async () => {
       if (isAnyRecordingActive()) {
-        showToast('屏幕共享已结束，当前录制也会同步停止。');
+        showToast('Screen sharing ended, so the current recording was stopped as well.');
         await stopRecording(true);
       }
     });
@@ -1430,7 +1689,7 @@ async function startRecording() {
   if (state.micEnabled) {
     await attachMicStream().catch((err) => {
       console.warn(err);
-      showToast('麦克风没有成功接入，当前先继续录系统音频。', 'error');
+      showToast('The microphone could not be attached, so recording will continue with system audio only for now.', 'error');
     });
   }
 
@@ -1443,7 +1702,7 @@ async function startRecording() {
   session.status = 'recording';
   syncSidebarRecordingState();
   scheduleRender();
-  showToast('录制已开始。切到别的 session 后也会继续在后台运行。');
+  showToast('Recording started. It will keep running in the background even if you switch to another session.');
 }
 
 async function stopRecording(fromShareEnded = false) {
@@ -1504,7 +1763,7 @@ async function stopRecording(fromShareEnded = false) {
   scheduleRender();
 
   if (!fromShareEnded) {
-    showToast('录制已停止。AI 笔记改为手动生成；Concept recap 仍会自动检测。');
+    showToast('Recording stopped. AI notes remain manual, while concept recaps are still detected automatically.');
   }
 }
 
@@ -1559,7 +1818,7 @@ async function cleanupAllMedia() {
 
 async function setupAudioPipeline() {
   const displayStream = state.recording.displayStream;
-  if (!displayStream) throw new Error('Display stream 未初始化。');
+  if (!displayStream) throw new Error('Display stream is not initialized.');
 
   const audioContext = new AudioContext();
   await audioContext.resume();
@@ -1621,7 +1880,7 @@ async function openSessionSocket() {
     const sessionId = state.recording.sessionId;
     const sessionMode = state.recording.sessionMode || state.currentSession?.mode || 'lecture';
     if (!sessionId) {
-      reject(new Error('录制 session 尚未初始化。'));
+      reject(new Error('The recording session is not initialized yet.'));
       return;
     }
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1654,11 +1913,11 @@ async function openSessionSocket() {
     };
 
     ws.onerror = () => {
-      if (!resolved) reject(new Error('WebSocket 连接失败。'));
+      if (!resolved) reject(new Error('WebSocket connection failed.'));
     };
 
     ws.onclose = () => {
-      if (!resolved) reject(new Error('WebSocket 提前关闭。'));
+      if (!resolved) reject(new Error('WebSocket closed early.'));
     };
 
     state.recording.ws = ws;
@@ -1734,12 +1993,12 @@ function handleSocketMessage(message) {
   if (type === 'notes_generated') {
     if (viewingRecordingSession) {
       state.currentNote = data;
-      finishProgress('notes', 'AI 笔记已生成');
-      finishProgress('action_items', '待办事项已提取');
+      finishProgress('notes', 'AI notes generated');
+      finishProgress('action_items', 'Action items extracted');
       clearInterval(state.recording.notePollTimer);
       state.recording.notePollTimer = null;
       scheduleRender();
-      showToast('AI 笔记与待办事项已生成。');
+      showToast('AI notes and action items generated.');
     }
     return;
   }
@@ -1759,7 +2018,7 @@ function handleSocketMessage(message) {
   }
 
   if (type === 'error') {
-    showToast(data?.message || '后端处理发生错误。', 'error');
+    showToast(data?.message || 'A backend error occurred.', 'error');
     return;
   }
 }
@@ -1841,8 +2100,8 @@ function startNotePolling() {
       const note = await api(`/api/sessions/${state.currentSession.id}/notes`).catch(() => null);
       if (note) {
         state.currentNote = note;
-        finishProgress('notes', 'AI 笔记已生成');
-        finishProgress('action_items', '待办事项已提取');
+        finishProgress('notes', 'AI notes generated');
+        finishProgress('action_items', 'Action items extracted');
         clearInterval(state.recording.notePollTimer);
         state.recording.notePollTimer = null;
         scheduleRender();
@@ -1861,11 +2120,11 @@ function startNotePolling() {
 
 async function generateNotes() {
   if (!state.currentSession) return;
-  if (!state.currentTranscript.length) throw new Error('当前没有 transcript 数据，暂时无法生成笔记。');
+  if (!state.currentTranscript.length) throw new Error('There is no transcript data yet, so notes cannot be generated right now.');
 
   state.generatingNotes = true;
-  startProgress('notes', '正在生成 AI 笔记');
-  startProgress('action_items', '正在提取待办事项');
+  startProgress('notes', 'Generating AI notes');
+  startProgress('action_items', 'Extracting action items');
   scheduleRender();
   try {
     const note = await api(`/api/sessions/${state.currentSession.id}/notes/generate`, {
@@ -1874,12 +2133,12 @@ async function generateNotes() {
     });
     state.currentNote = note;
     if (note?.method) state.selectedNoteMethod = note.method;
-    finishProgress('notes', 'AI 笔记已更新');
-    finishProgress('action_items', '待办事项已更新');
-    showToast('AI 笔记已更新。');
+    finishProgress('notes', 'AI notes updated');
+    finishProgress('action_items', 'Action items updated');
+    showToast('AI notes updated.');
   } catch (err) {
-    failProgress('notes', 'AI 笔记生成失败');
-    failProgress('action_items', '待办事项提取失败');
+    failProgress('notes', 'AI notes failed');
+    failProgress('action_items', 'Action item extraction failed');
     throw err;
   } finally {
     state.generatingNotes = false;
@@ -1889,15 +2148,15 @@ async function generateNotes() {
 
 async function generateConceptRecap() {
   if (!state.currentSession) return;
-  startProgress('recaps', '正在检测概念边界并生成总结');
+  startProgress('recaps', 'Detecting concept boundaries and generating a recap');
   try {
     const recap = await api(`/api/sessions/${state.currentSession.id}/concept-recap`, {
       method: 'POST',
       body: JSON.stringify({}),
     });
     if (recap?.skipped) {
-      resetProgress('recaps', recap.reason || '暂时没有新概念');
-      showToast(recap.reason || '暂时没有检测到新的概念边界。');
+      resetProgress('recaps', recap.reason || 'No new concepts yet');
+      showToast(recap.reason || 'No new concept boundaries detected yet.');
       return;
     }
     state.currentSummaries.push({
@@ -1907,12 +2166,12 @@ async function generateConceptRecap() {
       start_time: recap.start_time,
       end_time: recap.end_time,
     });
-    finishProgress('recaps', 'Concept recap 已生成');
+    finishProgress('recaps', 'Concept recap generated');
     state.activeTab = 'recaps';
-    showToast('Concept recap 已生成。');
+    showToast('Concept recap generated.');
     scheduleRender();
   } catch (err) {
-    failProgress('recaps', 'Concept recap 生成失败');
+    failProgress('recaps', 'Concept recap failed');
     throw err;
   }
 }
@@ -1932,7 +2191,7 @@ async function saveSpeakerMappings() {
   }
   state.showSpeakerModal = false;
   scheduleRender();
-  showToast('说话人映射已保存。');
+  showToast('Speaker mapping saved.');
 }
 
 async function handleExport() {
@@ -1943,10 +2202,10 @@ async function handleExport() {
     const blob = await fetchExportBlob(state.exportFormat);
     if (state.exportDestination === 'drive') {
       await uploadBlobToDrive(blob, `${sanitizeFilename(state.currentSession.title || 'session')}.${state.exportFormat}`);
-      showToast('文件已上传到 Google Drive。');
+      showToast('The file was uploaded to Google Drive.');
     } else {
       downloadBlob(blob, `${sanitizeFilename(state.currentSession.title || 'session')}.${state.exportFormat}`);
-      showToast('文件已开始下载。');
+      showToast('The download has started.');
     }
     state.showExportModal = false;
   } finally {
@@ -1959,32 +2218,18 @@ async function fetchExportBlob(format) {
   const response = await fetch(`/api/sessions/${state.currentSession.id}/export/${format}`);
   if (!response.ok) {
     const error = await safeErrorMessage(response);
-    throw new Error(error || '导出失败。请先生成 notes。');
+    throw new Error(error || 'Export failed. Generate notes first.');
   }
   return response.blob();
 }
 
 async function uploadBlobToDrive(blob, filename) {
-  if (!window.google?.accounts?.oauth2) {
-    throw new Error('Google Identity Services 还没有加载完成。');
-  }
-  const clientId = window.SCRIBE_CONFIG?.googleDriveClientId;
-  if (!clientId) {
-    throw new Error('缺少 Google Drive client ID 配置。');
+  const activeAccount = getActiveAccount();
+  if (!activeAccount || activeAccount.type !== 'google') {
+    throw new Error('The active account is not a Google account, so upload to Google Drive is unavailable.');
   }
 
-  const accessToken = await new Promise((resolve, reject) => {
-    const tokenClient = window.google.accounts.oauth2.initTokenClient({
-      client_id: clientId,
-      scope: 'https://www.googleapis.com/auth/drive.file',
-      callback: (resp) => {
-        if (resp.error) reject(new Error(resp.error));
-        else resolve(resp.access_token);
-      },
-    });
-    tokenClient.requestAccessToken({ prompt: 'consent' });
-  });
-
+  const accessToken = await ensureGoogleDriveAccessToken(activeAccount);
   const metadata = { name: filename };
   const form = new FormData();
   form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
@@ -1998,7 +2243,7 @@ async function uploadBlobToDrive(blob, filename) {
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`Google Drive 上传失败：${text}`);
+    throw new Error(`Google Drive upload failed: ${text}`);
   }
 }
 
@@ -2010,7 +2255,7 @@ async function askQuestion() {
   state.qaMessages.push({ role: 'user', content: question });
   state.qaInput = '';
   state.askingQuestion = true;
-  startProgress('qa', '正在生成回答');
+  startProgress('qa', 'Generating answer');
   scheduleRender();
 
   try {
@@ -2020,12 +2265,12 @@ async function askQuestion() {
     });
     state.qaMessages.push({
       role: 'assistant',
-      content: response.answer || '没有拿到回答。',
+      content: response.answer || 'No answer was returned.',
       sources: response.sources || [],
     });
-    finishProgress('qa', '回答已生成');
+    finishProgress('qa', 'Answer generated');
   } catch (err) {
-    failProgress('qa', '回答生成失败');
+    failProgress('qa', 'Answer failed');
     throw err;
   } finally {
     state.askingQuestion = false;
@@ -2044,7 +2289,7 @@ function debounceSaveTitle(id, value) {
       await refreshSidebarData();
       scheduleRender();
     } catch (err) {
-      showToast(err.message || '标题保存失败。', 'error');
+      showToast(err.message || 'Failed to save the title.', 'error');
     }
   }, 500));
 }
@@ -2410,7 +2655,7 @@ function closeContextMenu() {
 function openMoveModal(sessionIds = []) {
   const uniqueIds = Array.from(new Set((sessionIds || []).filter(Boolean)));
   if (!uniqueIds.length) {
-    showToast('先选择至少一个 session。', 'error');
+    showToast('Select at least one session first.', 'error');
     return;
   }
   state.moveSessionIds = uniqueIds;
@@ -2439,26 +2684,32 @@ async function moveSessionsToFolder(sessionIds, folderId) {
     state.currentSession.folder_id = folderId || null;
   }
   await refreshSidebarData();
-  showToast(ids.length > 1 ? '已批量移动 session。' : 'Session 已移动。');
+  showToast(ids.length > 1 ? 'Sessions moved.' : 'Session moved.');
 }
 
 async function deleteSessions(sessionIds) {
-  const ids = Array.from(new Set((sessionIds || []).filter(Boolean)));
+  const ids = (sessionIds || []).filter(Boolean);
   if (!ids.length) {
-    showToast('先选择至少一个 session。', 'error');
+    showToast('Select at least one session first.', 'error');
     return;
   }
-  const confirmed = window.confirm(ids.length > 1 ? `确定删除这 ${ids.length} 个 session 吗？` : '确定删除这个 session 吗？');
+  const confirmed = await askForConfirmation({
+    title: ids.length > 1 ? 'Delete sessions' : 'Delete session',
+    message: ids.length > 1 ? `Delete ${ids.length} selected sessions? This cannot be undone.` : 'Delete this session? This cannot be undone.',
+    confirmLabel: 'Delete',
+    cancelLabel: 'Cancel',
+    tone: 'danger',
+  });
   if (!confirmed) return;
   await Promise.all(ids.map((id) => api(`/api/sessions/${id}`, { method: 'DELETE' })));
   if (state.currentSession && ids.includes(state.currentSession.id)) {
-    await leaveSession();
+    await leaveSession({ preserveView: false });
   }
-  state.selectedSessionIds = [];
-  state.selectionMode = false;
+  state.selectedSessionIds = state.selectedSessionIds.filter((id) => !ids.includes(id));
   await refreshSidebarData();
-  showToast(ids.length > 1 ? '已删除所选 session。' : 'Session 已删除。');
+  closeContextMenu();
   scheduleRender();
+  showToast(ids.length > 1 ? 'Selected sessions deleted.' : 'Session deleted.');
 }
 
 async function autoRenameSession(sessionId) {
@@ -2467,7 +2718,7 @@ async function autoRenameSession(sessionId) {
   if (state.currentSession?.id === sessionId && result?.title) state.currentSession.title = result.title;
   await refreshSidebarData();
   scheduleRender();
-  showToast('AI rename 已完成。');
+  showToast('AI rename completed.');
 }
 
 function getDefaultNoteMethod(mode = 'lecture', methods = []) {
@@ -2480,7 +2731,7 @@ function getNoteMethodLabel(id = '') {
   return match?.name || id || 'default';
 }
 
-function createProgressState(label = '等待中') {
+function createProgressState(label = 'Waiting') {
   return {
     active: false,
     status: 'idle',
@@ -2516,7 +2767,7 @@ function finishProgress(key, label) {
   progress.active = false;
   progress.status = 'done';
   progress.percent = 100;
-  progress.label = label || '已完成';
+  progress.label = label || 'Done';
 }
 
 function failProgress(key, label) {
@@ -2526,11 +2777,11 @@ function failProgress(key, label) {
   progress.timer = null;
   progress.active = false;
   progress.status = 'error';
-  progress.label = label || '失败';
+  progress.label = label || 'Failed';
   progress.percent = Math.max(progress.percent || 0, 12);
 }
 
-function resetProgress(key, label = '等待中') {
+function resetProgress(key, label = 'Waiting') {
   const progress = state.progress[key];
   if (!progress) return;
   clearInterval(progress.timer);
@@ -2555,16 +2806,16 @@ function hasGeneratedContent(key) {
 
 function syncDerivedProgressStates() {
   const defaults = {
-    notes: '等待生成',
-    action_items: '等待提取',
-    recaps: '等待总结',
-    qa: '等待提问',
+    notes: 'Waiting to generate',
+    action_items: 'Waiting to extract',
+    recaps: 'Waiting to summarize',
+    qa: 'Waiting for a question',
   };
   const labels = {
-    notes: '已有已生成笔记',
-    action_items: '已有已提取待办',
-    recaps: '已有概念总结',
-    qa: '已有问答结果',
+    notes: 'Notes already generated',
+    action_items: 'Action items already extracted',
+    recaps: 'Concept recaps available',
+    qa: 'Answers already generated',
   };
 
   Object.keys(defaults).forEach((key) => {
@@ -2596,7 +2847,7 @@ function renderProgressPanel(key, title) {
           <div class="progress-status idle">Ready</div>
         </div>
         <div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>
-        <div class="progress-caption">等待你触发生成。</div>
+        <div class="progress-caption">Waiting for you to start it.</div>
       </div>
     `;
   }
@@ -2752,6 +3003,22 @@ function handleKeyDown(event) {
       state.showFolderModal = false;
       changed = true;
     }
+    if (state.showExportModal) {
+      state.showExportModal = false;
+      changed = true;
+    }
+    if (state.showSpeakerModal) {
+      state.showSpeakerModal = false;
+      changed = true;
+    }
+    if (state.showSettingsModal) {
+      state.showSettingsModal = false;
+      changed = true;
+    }
+    if (state.confirmDialog) {
+      resolveConfirmation(false);
+      return;
+    }
     if (changed) scheduleRender();
   }
 }
@@ -2761,6 +3028,331 @@ function autoResizeTitleField() {
   if (!field) return;
   field.style.height = '0px';
   field.style.height = `${Math.max(40, field.scrollHeight)}px`;
+}
+
+
+function hydrateClientPreferences() {
+  try {
+    state.accounts = JSON.parse(localStorage.getItem(ACCOUNT_STORAGE_KEY) || '[]');
+  } catch {
+    state.accounts = [];
+  }
+  state.accounts = Array.isArray(state.accounts) ? state.accounts : [];
+
+  try {
+    state.authTokens = JSON.parse(sessionStorage.getItem(GOOGLE_TOKEN_STORAGE_KEY) || '{}');
+  } catch {
+    state.authTokens = {};
+  }
+
+  state.activeAccountId = localStorage.getItem(ACTIVE_ACCOUNT_STORAGE_KEY) || '';
+  state.theme = localStorage.getItem(THEME_STORAGE_KEY) || 'light';
+
+  if (state.activeAccountId && !state.accounts.some((account) => account.id === state.activeAccountId)) {
+    state.activeAccountId = '';
+  }
+  if (!state.activeAccountId && state.accounts.length) {
+    state.activeAccountId = state.accounts[0].id;
+  }
+}
+
+function persistAccounts() {
+  localStorage.setItem(ACCOUNT_STORAGE_KEY, JSON.stringify(state.accounts));
+  localStorage.setItem(ACTIVE_ACCOUNT_STORAGE_KEY, state.activeAccountId || '');
+}
+
+function persistAuthTokens() {
+  sessionStorage.setItem(GOOGLE_TOKEN_STORAGE_KEY, JSON.stringify(state.authTokens || {}));
+}
+
+function getActiveAccount() {
+  return state.accounts.find((account) => account.id === state.activeAccountId) || null;
+}
+
+function getAccountDisplayName(account) {
+  if (!account) return 'Guest';
+  if (account.displayName) return account.displayName;
+  const combined = `${account.firstName || ''} ${account.lastName || ''}`.trim();
+  return combined || account.email || 'Untitled account';
+}
+
+function getAccountInitials(account) {
+  if (!account) return 'JP';
+  if (account.type === 'email') {
+    const first = (account.firstName || account.displayName || account.email || 'U').trim();
+    const last = (account.lastName || '').trim();
+    const a = first.charAt(0) || 'U';
+    const b = last ? last.slice(-1) : (first.charAt(1) || a);
+    return `${a}${b}`.toUpperCase();
+  }
+
+  const words = getAccountDisplayName(account).split(/\s+/).filter(Boolean);
+  if (words.length >= 2) return `${words[0][0] || ''}${words[1][0] || ''}`.toUpperCase();
+  const first = words[0] || account.email || 'G';
+  return first.slice(0, 2).toUpperCase();
+}
+
+function normalizeGoogleAvatarUrl(url = '') {
+  let value = String(url || '').trim();
+  if (!value) return '';
+  if (/googleusercontent\.com/i.test(value)) {
+    value = value.replace(/=s\d+(-c)?/i, '=s256-c');
+  }
+  return value;
+}
+
+function renderAccountAvatar(account) {
+  const initials = getAccountInitials(account);
+  if (account?.avatarUrl) {
+    const src = normalizeGoogleAvatarUrl(account.avatarUrl);
+    return `<div class="avatar avatar-photo-wrap"><span class="avatar-fallback">${escapeHtml(initials)}</span><img class="avatar-photo" src="${escapeAttr(src)}" alt="${escapeAttr(getAccountDisplayName(account))}" referrerpolicy="no-referrer" loading="eager" onerror="this.style.display='none'; this.closest('.avatar-photo-wrap')?.classList.add('image-failed');" /></div>`;
+  }
+  return `<div class="avatar">${escapeHtml(initials)}</div>`;
+}
+
+function upsertAccount(account) {
+  const existingIndex = state.accounts.findIndex((item) => item.id === account.id);
+  if (existingIndex >= 0) state.accounts.splice(existingIndex, 1, { ...state.accounts[existingIndex], ...account });
+  else state.accounts = [account, ...state.accounts];
+  state.activeAccountId = account.id;
+  persistAccounts();
+}
+
+function switchActiveAccount(accountId) {
+  if (!accountId || !state.accounts.some((account) => account.id === accountId)) return;
+  state.activeAccountId = accountId;
+  persistAccounts();
+  if (state.exportDestination === 'drive' && !canUseDriveExport()) {
+    state.exportDestination = 'download';
+  }
+  scheduleRender();
+  const account = getActiveAccount();
+  showToast(`${getAccountDisplayName(account)} is now the active account.`);
+}
+
+async function removeAccount(accountId) {
+  if (!accountId) return;
+  const account = state.accounts.find((item) => item.id === accountId);
+  if (!account) return;
+  const confirmed = await askForConfirmation({
+    title: 'Remove account',
+    message: `Remove ${getAccountDisplayName(account)} from this device?`,
+    confirmLabel: 'Remove',
+    cancelLabel: 'Keep',
+    tone: 'danger',
+  });
+  if (!confirmed) return;
+
+  if (account.type === 'google') {
+    const token = state.authTokens?.[account.id]?.accessToken;
+    if (token && window.google?.accounts?.oauth2?.revoke) {
+      try {
+        window.google.accounts.oauth2.revoke(token, () => {});
+      } catch {}
+    }
+    if (state.authTokens?.[account.id]) {
+      delete state.authTokens[account.id];
+      persistAuthTokens();
+    }
+  }
+
+  state.accounts = state.accounts.filter((item) => item.id !== accountId);
+  if (state.activeAccountId === accountId) {
+    state.activeAccountId = state.accounts[0]?.id || '';
+  }
+  if (state.exportDestination === 'drive' && !canUseDriveExport()) {
+    state.exportDestination = 'download';
+  }
+  persistAccounts();
+  scheduleRender();
+  showToast('Account removed.');
+}
+
+function setTheme(theme) {
+  state.theme = theme === 'dark' ? 'dark' : 'light';
+  localStorage.setItem(THEME_STORAGE_KEY, state.theme);
+  applyTheme();
+  scheduleRender();
+}
+
+function applyTheme() {
+  document.documentElement.dataset.theme = state.theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.style.colorScheme = state.theme === 'dark' ? 'dark' : 'light';
+}
+
+function canUseDriveExport() {
+  const account = getActiveAccount();
+  return Boolean(account && account.type === 'google');
+}
+
+function getDriveExportDescription() {
+  const account = getActiveAccount();
+  if (account?.type === 'google') return `Upload directly to ${getAccountDisplayName(account)}'s Google Drive`;
+  return 'Switch to a Google sign-in first';
+}
+
+function isValidEmail(email = '') {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim());
+}
+
+async function addEmailAccount() {
+  const firstName = String(state.emailAccountDraft.firstName || '').trim();
+  const lastName = String(state.emailAccountDraft.lastName || '').trim();
+  const email = String(state.emailAccountDraft.email || '').trim().toLowerCase();
+
+  if (!firstName || !lastName || !email) {
+    showToast('Please fill in first name, last name, and email.', 'error');
+    return;
+  }
+  if (!isValidEmail(email)) {
+    showToast('The email format is invalid.', 'error');
+    return;
+  }
+
+  const id = `email:${email}`;
+  upsertAccount({
+    id,
+    type: 'email',
+    firstName,
+    lastName,
+    displayName: `${firstName} ${lastName}`.trim(),
+    email,
+    avatarUrl: '',
+    createdAt: new Date().toISOString(),
+  });
+
+  state.emailAccountDraft = { firstName: '', lastName: '', email: '' };
+  scheduleRender();
+  showToast('Email account added and set as active.');
+}
+
+function getGoogleClientId() {
+  const clientId = window.SCRIBE_CONFIG?.googleDriveClientId;
+  if (!clientId) throw new Error('Missing Google OAuth client ID configuration.');
+  return clientId;
+}
+
+async function requestGoogleAccessToken({ prompt = 'select_account consent', loginHint = '' } = {}) {
+  if (!window.google?.accounts?.oauth2) {
+    throw new Error('Google Identity Services has not finished loading yet.');
+  }
+
+  const clientId = getGoogleClientId();
+  return await new Promise((resolve, reject) => {
+    const tokenClient = window.google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: GOOGLE_AUTH_SCOPE,
+      prompt,
+      login_hint: loginHint || undefined,
+      include_granted_scopes: true,
+      callback: (resp) => {
+        if (!resp || resp.error) {
+          reject(new Error(resp?.error_description || resp?.error || 'Google authorization failed.'));
+          return;
+        }
+        resolve(resp);
+      },
+      error_callback: (err) => {
+        reject(new Error(err?.type || 'The Google sign-in window did not complete successfully.'));
+      },
+    });
+    tokenClient.requestAccessToken({ prompt, login_hint: loginHint || undefined });
+  });
+}
+
+async function fetchGoogleUserProfile(accessToken) {
+  const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    throw new Error('Failed to load Google user information.');
+  }
+  return response.json();
+}
+
+async function addGoogleAccount() {
+  state.authBusy = true;
+  scheduleRender();
+  try {
+    const tokenResponse = await requestGoogleAccessToken({ prompt: 'select_account consent' });
+    const profile = await fetchGoogleUserProfile(tokenResponse.access_token);
+    const account = {
+      id: `google:${profile.sub}`,
+      type: 'google',
+      firstName: profile.given_name || '',
+      lastName: profile.family_name || '',
+      displayName: profile.name || [profile.given_name, profile.family_name].filter(Boolean).join(' ') || profile.email || 'Google user',
+      email: profile.email || '',
+      avatarUrl: normalizeGoogleAvatarUrl(profile.picture || ''),
+      sub: profile.sub,
+      createdAt: new Date().toISOString(),
+    };
+    upsertAccount(account);
+    state.authTokens[account.id] = {
+      accessToken: tokenResponse.access_token,
+      expiresAt: Date.now() + Math.max(0, Number(tokenResponse.expires_in || 0) * 1000),
+      scope: tokenResponse.scope || GOOGLE_AUTH_SCOPE,
+    };
+    persistAuthTokens();
+    scheduleRender();
+    showToast(`Google account ${account.displayName} connected.`);
+  } finally {
+    state.authBusy = false;
+    scheduleRender();
+  }
+}
+
+async function ensureGoogleDriveAccessToken(account) {
+  if (!account || account.type !== 'google') {
+    throw new Error('The active account is not a Google account.');
+  }
+
+  const existing = state.authTokens?.[account.id];
+  if (existing?.accessToken && Number(existing.expiresAt || 0) > Date.now() + 60_000) {
+    return existing.accessToken;
+  }
+
+  const tokenResponse = await requestGoogleAccessToken({
+    prompt: '',
+    loginHint: account.email || account.sub || '',
+  }).catch(async () => requestGoogleAccessToken({
+    prompt: 'consent',
+    loginHint: account.email || account.sub || '',
+  }));
+
+  state.authTokens[account.id] = {
+    accessToken: tokenResponse.access_token,
+    expiresAt: Date.now() + Math.max(0, Number(tokenResponse.expires_in || 0) * 1000),
+    scope: tokenResponse.scope || GOOGLE_AUTH_SCOPE,
+  };
+  persistAuthTokens();
+  return tokenResponse.access_token;
+}
+
+function askForConfirmation({
+  title = 'Confirm action',
+  message = 'Are you sure you want to continue?',
+  confirmLabel = 'Confirm',
+  cancelLabel = 'Cancel',
+  tone = 'danger',
+} = {}) {
+  if (pendingConfirmResolver) {
+    pendingConfirmResolver(false);
+    pendingConfirmResolver = null;
+  }
+  state.confirmDialog = { title, message, confirmLabel, cancelLabel, tone };
+  scheduleRender();
+  return new Promise((resolve) => {
+    pendingConfirmResolver = resolve;
+  });
+}
+
+function resolveConfirmation(result) {
+  const resolve = pendingConfirmResolver;
+  pendingConfirmResolver = null;
+  state.confirmDialog = null;
+  scheduleRender();
+  if (resolve) resolve(Boolean(result));
 }
 
 function showToast(message, type = 'info') {
