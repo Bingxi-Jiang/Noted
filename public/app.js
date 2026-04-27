@@ -616,7 +616,7 @@ function renderActionItemsTab() {
     <div class="note-body">
       <div class="info-callout">
         <div>🧠</div>
-        <div>These action items come from the real backend, not a frontend mock. Meeting mode emphasizes owners and deliverables; lecture mode emphasizes homework, quizzes, readings, and reminders.</div>
+        <div>Meeting mode emphasizes owners and deliverables; lecture mode emphasizes homework, quizzes, readings, and reminders.</div>
       </div>
       <div class="action-list">
         ${items.length ? items.map(renderActionItem).join('') : `<div class="muted">No clear action items were detected.</div>`}
