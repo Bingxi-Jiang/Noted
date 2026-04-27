@@ -1,132 +1,273 @@
-# 🎙️ SCRIBE — Real-Time Transcription System
+<div align="center">
 
-A full-stack real-time transcription app with rolling summaries, topic detection, and RAG-powered Q&A.
+# Noted
+
+### Real-time transcription, AI notes, visual context, and searchable knowledge for lectures and meetings.
+
+<p>
+  <a href="#features"><img alt="AI Notes" src="https://img.shields.io/badge/AI%20Notes-Gemini-7c3aed?style=for-the-badge" /></a>
+  <a href="#tech-stack"><img alt="Realtime" src="https://img.shields.io/badge/Realtime-WebSocket-2962ff?style=for-the-badge" /></a>
+  <a href="#export"><img alt="Export" src="https://img.shields.io/badge/Export-PDF%20%7C%20DOCX-067647?style=for-the-badge" /></a>
+  <a href="#quick-start"><img alt="Node" src="https://img.shields.io/badge/Node.js-18%2B-172033?style=for-the-badge" /></a>
+</p>
+
+<p>
+  <b>Noted turns live audio and screen context into structured notes, action items, concept recaps, and searchable Q&A.</b>
+</p>
+
+<p>
+  <a href="#why-noted">Why</a> •
+  <a href="#features">Features</a> •
+  <a href="#screenshots">Screenshots</a> •
+  <a href="#architecture">Architecture</a> •
+  <a href="#quick-start">Quick Start</a>
+</p>
+
+</div>
+
+---
+
+## Why Noted
+
+Most transcription tools stop at raw text. Noted is built for the moment after transcription: turning messy, real-time audio into a usable knowledge workspace.
+
+It supports two practical workflows:
+
+- **Lecture Mode** — capture classes, talks, and study sessions; generate Cornell or outline notes; detect concept boundaries; extract student-facing reminders such as homework, quizzes, readings, and deadlines.
+- **Meeting Mode** — capture syncs, standups, planning calls, and retros; use speaker diarization; rename speakers; generate meeting minutes; extract owners, deadlines, and deliverables.
+
+Noted also uses optional screen capture analysis, so slides, diagrams, code walkthroughs, whiteboards, and shared-screen context can improve the final notes instead of being lost outside the transcript.
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%">
+      <h3>Home Page</h3>
+      <img src="docs/images/dashboard.png" alt="Noted dashboard screenshot" width="100%" />
+    </td>
+    <td width="50%">
+      <h3>Live Transcription</h3>
+      <img src="docs/images/live-transcript.png" alt="Live transcription screenshot" width="100%" />
+    </td>
+  </tr>
+</table>
+
+---
+
+## Features
+
+### Live transcription
+
+- Real-time WebSocket audio streaming from the browser to the backend.
+- Deepgram-powered speech-to-text with interim and final transcript events.
+- System audio as the primary input, with optional microphone mixing.
+- Meeting-mode speaker diarization with editable speaker names.
+
+### AI note generation
+
+- Gemini-powered structured notes from transcript chunks and screen context.
+- Lecture note styles:
+  - Cornell Method
+  - Outline Method
+- Meeting note style:
+  - Meeting Minutes
+- Manual note generation to control cost and avoid unnecessary token usage.
+
+### Visual context capture
+
+- Optional screen sharing support.
+- Periodic frame capture from the shared screen.
+- Gemini vision analysis for slide text, diagrams, visual elements, and contextual clues.
+- Visual context is stored alongside transcript data and used during note generation.
+
+### Concept recaps
+
+- Lecture-focused concept boundary detection.
+- Automatic and manual concept recap generation.
+- Recap cards include topic labels and time ranges.
+
+### Action item extraction
+
+- Lecture mode extracts class-facing tasks: assignments, readings, quizzes, exams, reminders, forms, office hours, and deadlines.
+- Meeting mode extracts owner/deadline/deliverable-style action items.
+- Extraction logs distinguish included vs. excluded candidates for better debugging and trust.
+
+### Searchable Q&A
+
+- Ask questions against the current session transcript.
+- If a session belongs to a folder, Q&A can search across the folder’s sessions.
+- Responses include source transcript snippets and timestamps.
+
+### Organization
+
+- Folder-based session organization.
+- Drag-and-drop session moves.
+- Searchable sidebar.
+- Session title editing and AI-powered auto-title generation.
+
+### Export
+
+- Export generated notes as:
+  - PDF
+  - DOCX
+- Optional Google Drive upload through Google Identity Services and Drive file scope.
+
+---
+
+## Product Flow
+
+```mermaid
+flowchart LR
+  A[Create Lecture or Meeting Session] --> B[Start Recording]
+  B --> C[Browser Captures System Audio]
+  B --> D[Optional Microphone]
+  B --> E[Optional Screen Capture]
+  C --> F[WebSocket Audio Stream]
+  D --> F
+  F --> G[Deepgram Live Transcription]
+  G --> H[Transcript Chunks]
+  E --> I[Gemini Vision Analysis]
+  I --> J[Screen Context]
+  H --> K[SQLite Persistence]
+  J --> K
+  K --> L[Gemini Notes / Recaps / Action Items]
+  K --> M[Session and Folder Q&A]
+  L --> N[PDF / DOCX / Google Drive Export]
+```
+
+---
 
 ## Architecture
 
+```mermaid
+flowchart TB
+  subgraph Client[Browser Client]
+    UI[Single-page UI]
+    Audio[Audio Capture Pipeline]
+    Screen[Screen Capture Loop]
+    Drive[Google Drive Export]
+  end
+
+  subgraph Server[Node.js Backend]
+    Express[Express REST API]
+    WS[WebSocket Server]
+    Transcriber[Deepgram Transcriber]
+    Gemini[Gemini Summarizer + Vision]
+    Exporter[PDF / DOCX Exporter]
+  end
+
+  subgraph Data[Local Persistence]
+    SQLite[(sql.js SQLite Database)]
+    Sessions[Sessions]
+    Chunks[Transcript Chunks]
+    Notes[Notes]
+    Summaries[Summaries]
+    Screens[Screen Captures]
+  end
+
+  UI --> Express
+  Audio --> WS
+  Screen --> Express
+  WS --> Transcriber
+  Transcriber --> Chunks
+  Express --> Gemini
+  Gemini --> Notes
+  Gemini --> Summaries
+  Gemini --> Screens
+  Express --> Exporter
+  Express --> SQLite
+  Chunks --> SQLite
+  Notes --> SQLite
+  Summaries --> SQLite
+  Screens --> SQLite
+  Drive --> UI
 ```
-Browser (Mic) ──audio──▸ WebSocket ──▸ Deepgram STT (streaming)
-                                           │
-                                    ┌──────┴──────┐
-                                    │ partial      │ final
-                                    │ transcript   │ transcript
-                                    │ (live UI)    │ (→ SQLite)
-                                    └──────────────┘
-                                           │
-                              ┌────────────┼────────────┐
-                              ▼            ▼            ▼
-                        Rolling       Topic         RAG Q&A
-                        Summary     Detection     (keyword search
-                        (Claude)    (Claude)       + Claude)
-```
 
-### Files
+---
 
-| File | Purpose |
-|------|---------|
-| `server.js` | Express + WebSocket server, routes, session management |
-| `transcriber.js` | Deepgram streaming bridge (audio → text) |
-| `summarizer.js` | Claude API calls for summaries, topic detection, Q&A |
-| `db.js` | SQLite (sql.js) — sessions, transcript chunks, summaries |
-| `public/index.html` | Single-page frontend with all UI |
-| `.env` | API keys (Deepgram + Anthropic) |
+## Tech Stack
 
-## Setup
+| Layer | Tools |
+|---|---|
+| Frontend | Vanilla JavaScript, HTML, CSS, Web Audio API, Screen Capture API |
+| Backend | Node.js, Express, WebSocket `ws` |
+| Transcription | Deepgram Live Transcription API |
+| AI Reasoning | Gemini text generation and vision analysis |
+| Database | `sql.js` SQLite persisted to `transcription.db` |
+| Export | `pdfkit`, `docx` |
+| Auth / Cloud Export | Google Identity Services, Google Drive `drive.file` scope |
+| Utilities | `dotenv`, `uuid` |
 
-### 1. Install
+---
+
+## Quick Start
+
+### 1. Install dependencies
 
 ```bash
 npm install
 ```
 
-### 2. Configure API Keys
+### 2. Create environment variables
 
-Edit `.env`:
+Create a `.env` file in the project root:
 
-```env
-DEEPGRAM_API_KEY=your_key_here     # https://deepgram.com (free tier available)
-ANTHROPIC_API_KEY=your_key_here    # https://console.anthropic.com
+```bash
+DEEPGRAM_API_KEY=your_deepgram_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 PORT=3000
 ```
 
-### 3. Run
+### 3. Configure Google Drive export
+
+Open:
+
+```txt
+public/google-drive-config.js
+```
+
+Replace the OAuth client ID if you want to use your own Google Cloud project:
+
+```js
+window.SCRIBE_CONFIG = Object.assign(
+  {
+    googleDriveClientId: 'your_google_oauth_web_client_id.apps.googleusercontent.com',
+  },
+  window.SCRIBE_CONFIG || {}
+);
+```
+
+Google Drive export is optional. Local PDF and DOCX downloads work without Google Drive.
+
+### 4. Start the app
 
 ```bash
-npm start
+npm run dev
 ```
 
-Open `http://localhost:3000`
+Then open:
 
-## Features
-
-### Real-Time Transcription
-- **Partial transcripts** — appear instantly as you speak (italic, purple border)
-- **Final transcripts** — confirmed text saved to DB with timestamps (green border)
-- Three view modes: **Split** (partial + final labeled), **Combined** (flowing text), **Final Only**
-
-### Rolling Summaries (configurable)
-Three modes available in the sidebar:
-
-| Mode | Behavior |
-|------|----------|
-| **Time-based** | Auto-summarize every N minutes (2, 5, 10, 15) |
-| **Topic-based** | Detect topic changes and summarize when speaker shifts subjects |
-| **Manual** | Click buttons to summarize on demand |
-
-### Q&A (RAG)
-- Ask questions about anything said in the session
-- Uses keyword search to find relevant transcript chunks
-- Claude answers with timestamp references (e.g. "Around 5:30, the speaker mentioned...")
-- Source timestamps shown below each answer
-
-### Timeline
-- Visual timeline of summaries and topic changes
-- Color-coded: purple (events), orange (topics), cyan (summaries)
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/sessions` | List all sessions |
-| `POST` | `/api/sessions` | Create new session |
-| `GET` | `/api/sessions/:id/chunks` | Get all transcript chunks |
-| `GET` | `/api/sessions/:id/summaries` | Get all summaries |
-| `POST` | `/api/sessions/:id/ask` | Q&A — `{ "question": "..." }` |
-| `POST` | `/api/sessions/:id/summarize` | Trigger summary — `{ "mode": "all"|"time", "minutes": 5 }` |
-
-## WebSocket Protocol
-
-Connect to `ws://localhost:3000/ws`
-
-### Client → Server
-
-```json
-{ "type": "start_session", "session_id": "...", "summary_mode": "time", "summary_interval": 5 }
-{ "type": "stop_session" }
-{ "type": "update_settings", "summary_mode": "topic" }
-// Binary: raw PCM 16-bit 16kHz mono audio frames
+```txt
+http://localhost:3000
 ```
-
-### Server → Client
-
-```json
-{ "type": "partial_transcript", "data": { "text": "...", "start": 0, "end": 1.5 } }
-{ "type": "final_transcript", "data": { "text": "...", "start": 0, "end": 1.5, "speaker": "speaker_0" } }
-{ "type": "summary", "data": { "summary_text": "...", "start_time": 0, "end_time": 300 } }
-{ "type": "topic_change", "data": { "topic": "Neural Networks" } }
-```
-
-## Notes
-
-- SQLite DB file is stored at `./transcription.db` (auto-created)
-- Audio is processed as PCM 16-bit, 16kHz mono (browser does conversion)
-- Deepgram Nova-2 model is used by default (best accuracy/speed)
-- Summaries use Claude claude-sonnet-4-20250514 via Anthropic API
 ---
-## Todo List
 
-- [ ] Lecture mode using mic
-- [ ] Meeting mode default name is "speaker 2"
-- [ ] Chinese words in Meeting notes
-- [ ] Latex not displaying in notes
-- [ ] Session did not load audio
+## Roadmap
+
+- [ ] Add login-backed cloud sync for sessions and notes.
+- [ ] Add vector embeddings for stronger semantic retrieval.
+- [ ] Add calendar integration for meeting metadata.
+- [ ] Add note templates for research talks, office hours, interviews, and project standups.
+
+---
+
+<div align="center">
+
+### Built for people who do not just want transcripts — they want usable memory.
+
+<b>Noted</b> captures what happened, understands what mattered, and helps you act on it.
+
+</div>
