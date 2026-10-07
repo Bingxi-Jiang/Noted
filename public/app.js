@@ -10,7 +10,7 @@ const GOOGLE_AUTH_SCOPE = 'openid email profile https://www.googleapis.com/auth/
 
 const state = {
   view: 'home',
-  sidebarOpen: true,
+  sidebarOpen: !window.matchMedia('(max-width: 767px)').matches,
   folders: [],
   sessions: [],
   activeFolderId: '',
@@ -95,6 +95,7 @@ const titleSaveTimers = new Map();
 let renderScheduled = false;
 let toastTimer = null;
 let pendingConfirmResolver = null;
+const modalFocusStack = [];
 let latestOpenSessionToken = 0;
 const TRANSCRIPT_PREVIEW_LIMIT = 320;
 
@@ -121,6 +122,11 @@ function attachGlobalHandlers() {
   app.addEventListener('drop', handleDrop);
   window.addEventListener('keydown', handleKeyDown);
   window.addEventListener('beforeunload', cleanupAllMedia);
+  window.matchMedia('(max-width: 767px)').addEventListener('change', (event) => {
+    state.sidebarOpen = !event.matches;
+    scheduleRender();
+  });
+  window.addEventListener('resize', autoResizeTitleField);
 }
 
 function scheduleRender() {
@@ -135,16 +141,24 @@ function scheduleRender() {
 function render() {
   syncDerivedProgressStates();
   const focusState = captureFocusState();
+  const previousSessionId = app.querySelector('[data-model="session-title"]')?.dataset.sessionId;
+  const previousTab = app.querySelector('.tab-btn.active')?.dataset.tab;
+  const scrollState = ['.sidebar-content', '.home-view', '.workspace-body', '.insight-scroll', '.modal-body', '.tab-row', '[data-transcript-scroll]']
+    .map(selector => {
+      const element = app.querySelector(selector);
+      return { selector, top: element?.scrollTop || 0, left: element?.scrollLeft || 0 };
+    });
+  const previousModalCount = app.querySelectorAll('.modal').length;
   const transcriptScrollBefore = app.querySelector('[data-transcript-scroll]');
   const shouldStickTranscriptToBottom = transcriptScrollBefore
     ? transcriptScrollBefore.scrollHeight - transcriptScrollBefore.scrollTop - transcriptScrollBefore.clientHeight < 80
     : true;
 
   app.innerHTML = `
-    <div class="app-shell">
+    <div class="app-shell ${state.sidebarOpen ? 'sidebar-open' : ''}">
       ${renderSidebar()}
+      ${state.sidebarOpen ? '<button class="sidebar-backdrop" data-action="toggle-sidebar" aria-label="Close sidebar" tabindex="-1"></button>' : ''}
       <main class="main">
-        ${!state.sidebarOpen ? '<div class="sidebar-peek-btn"><button class="icon-btn" data-action="toggle-sidebar" title="Expand sidebar">☰</button></div>' : ''}
         ${renderBackgroundRecordingBanner()}
         ${state.view === 'home' ? renderHome() : renderWorkspace()}
       </main>
@@ -161,10 +175,85 @@ function render() {
 
   restoreFocusState(focusState);
   autoResizeTitleField();
+  scrollState.forEach(({ selector, top, left }) => {
+    const element = app.querySelector(selector);
+    const sessionChanged = previousSessionId !== state.currentSession?.id;
+    const tabChanged = previousTab !== state.activeTab;
+    if (element && !(sessionChanged && ['.workspace-body', '.insight-scroll', '[data-transcript-scroll]'].includes(selector))
+      && !(tabChanged && selector === '.insight-scroll')) {
+      element.scrollTop = top;
+      element.scrollLeft = left;
+    }
+  });
+  prepareAccessibleUI(previousModalCount);
 
   const transcriptScroll = app.querySelector('[data-transcript-scroll]');
   if (transcriptScroll && shouldStickTranscriptToBottom) {
     transcriptScroll.scrollTop = transcriptScroll.scrollHeight;
+  }
+}
+
+function icon(name, extraClass = '') {
+  return `<svg class="ui-icon ${extraClass}" aria-hidden="true" focusable="false"><use href="/icons/phosphor.svg#${name}"></use></svg>`;
+}
+
+function prepareAccessibleUI(previousModalCount) {
+  const modals = [...app.querySelectorAll('.modal')];
+  const modal = modals.at(-1);
+  const mobileDrawer = state.sidebarOpen && window.matchMedia('(max-width: 767px)').matches;
+  if (modals.length > previousModalCount) modalFocusStack.push(captureFocusState());
+  app.querySelector('.main').inert = Boolean(modal) || mobileDrawer;
+  app.querySelector('.sidebar').inert = Boolean(modal) || !state.sidebarOpen;
+  modals.forEach((dialog, index) => {
+    dialog.closest('.modal-layer').inert = dialog !== modal;
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', String(dialog === modal));
+    const title = dialog.querySelector('.modal-title');
+    if (title) { title.id = `dialog-title-${index}`; dialog.setAttribute('aria-labelledby', title.id); }
+  });
+  if (modals.length < previousModalCount) restoreFocusState(modalFocusStack.pop());
+  if (modal) {
+    if (!modal.contains(document.activeElement)) modal.querySelector('input, select, button')?.focus({ preventScroll: true });
+  }
+  if (!modal && mobileDrawer && !app.querySelector('.sidebar').contains(document.activeElement)) {
+    app.querySelector('.sidebar-close')?.focus({ preventScroll: true });
+  }
+  app.querySelectorAll('button[title]').forEach(button => {
+    if (!button.hasAttribute('aria-label')) button.setAttribute('aria-label', button.title);
+  });
+  app.querySelectorAll('.modal-head .icon-btn').forEach(button => button.setAttribute('aria-label', 'Close dialog'));
+  app.querySelectorAll('.color-swatch').forEach(button => {
+    button.setAttribute('aria-label', `Folder color ${button.dataset.color}`);
+    button.setAttribute('aria-pressed', String(button.classList.contains('active')));
+  });
+  app.querySelectorAll('.export-option').forEach(button => button.setAttribute('aria-pressed', String(button.classList.contains('selected'))));
+  app.querySelectorAll('.session-item').forEach(button => {
+    if (state.selectionMode) button.setAttribute('aria-pressed', String(state.selectedSessionIds.includes(button.dataset.sessionId)));
+    else if (button.classList.contains('active')) button.setAttribute('aria-current', 'page');
+  });
+  app.querySelectorAll('[data-speaker-key]').forEach(input => input.setAttribute('aria-label', `Name for ${shortSpeakerKey(input.dataset.speakerKey)}`));
+  app.querySelectorAll('.field-group').forEach((group, index) => {
+    const field = group.querySelector('input, select, textarea');
+    const label = group.querySelector('.field-label');
+    if (!field || !label || field.hasAttribute('aria-label')) return;
+    label.id ||= `field-label-${index}`;
+    field.setAttribute('aria-labelledby', label.id);
+  });
+  app.querySelector('[data-model="session-title"]')?.setAttribute('aria-label', 'Session title');
+  app.querySelector('.toast')?.setAttribute('role', 'status');
+  const contextMenu = app.querySelector('.context-menu');
+  if (contextMenu) {
+    const bounds = contextMenu.getBoundingClientRect();
+    contextMenu.style.left = `${Math.max(12, Math.min(bounds.left, window.innerWidth - bounds.width - 12))}px`;
+    contextMenu.style.top = `${Math.max(12, Math.min(bounds.top, window.innerHeight - bounds.height - 12))}px`;
+  }
+  const activeTab = app.querySelector('.tab-btn.active');
+  const tabRow = activeTab?.parentElement;
+  if (activeTab && tabRow && document.activeElement === activeTab) {
+    if (activeTab.offsetLeft < tabRow.scrollLeft) tabRow.scrollLeft = activeTab.offsetLeft;
+    else if (activeTab.offsetLeft + activeTab.offsetWidth > tabRow.scrollLeft + tabRow.clientWidth) {
+      tabRow.scrollLeft = activeTab.offsetLeft + activeTab.offsetWidth - tabRow.clientWidth;
+    }
   }
 }
 
@@ -181,13 +270,16 @@ function renderSidebar() {
   });
 
   return `
-    <aside class="sidebar ${state.sidebarOpen ? '' : 'collapsed'}">
+    <aside class="sidebar ${state.sidebarOpen ? '' : 'collapsed'}" id="session-sidebar" aria-label="Folders and sessions">
       <div class="sidebar-header">
-        <div class="brand-title">Noted</div>
-        <div class="brand-subtitle">Live transcription, AI notes, action items, and Q&A in one workspace</div>
+        <div class="sidebar-brand-row">
+          <button class="brand-title" data-action="back-home" title="Noted home">Noted</button>
+          <button class="icon-btn sidebar-close" data-action="toggle-sidebar" title="Collapse sidebar">${icon('sidebar-simple')}</button>
+        </div>
+        <div class="brand-subtitle">Your notes, all in one place.</div>
         <div class="search-box">
-          <span class="search-icon">⌕</span>
-          <input data-model="searchQuery" value="${escapeAttr(state.searchQuery)}" placeholder="Search folders / sessions..." />
+          <span class="search-icon">${icon('magnifying-glass')}</span>
+          <input data-model="searchQuery" aria-label="Search folders and sessions" value="${escapeAttr(state.searchQuery)}" placeholder="Search folders / sessions..." />
         </div>
       </div>
 
@@ -199,7 +291,7 @@ function renderSidebar() {
           </div>
           <div class="list">
             <button class="list-item ${state.activeFolderId === '' ? 'active' : ''} ${state.dragOverFolderId === '__root__' ? 'drag-hover' : ''}" data-action="filter-folder" data-folder-id="" data-folder-drop-target="true">
-              <span class="folder-icon">🗂️</span>
+              <span class="folder-icon">${icon('folders')}</span>
               <div class="list-copy">
                 <div class="list-title">All Sessions</div>
                 <div class="list-meta">${state.sessions.length} sessions</div>
@@ -247,8 +339,7 @@ function renderSidebarFooter() {
         </div>
       </button>
       <div class="sidebar-footer-actions">
-        <button class="icon-btn" data-action="open-settings" title="Settings">⚙</button>
-        <button class="icon-btn" data-action="toggle-sidebar" title="Collapse sidebar">≡</button>
+        <button class="icon-btn" data-action="open-settings" title="Settings">${icon('gear-six')}</button>
       </div>
     </div>
   `;
@@ -273,13 +364,13 @@ function renderFolderItem(folder) {
 function renderSessionItem(session) {
   const active = state.currentSession?.id === session.id;
   const selected = state.selectedSessionIds.includes(session.id);
-  const icon = session.mode === 'meeting' ? '👥' : '🎓';
+  const sessionIcon = icon(session.mode === 'meeting' ? 'users' : 'graduation-cap');
   const meta = `${formatDate(session.created_at)} · ${session.mode}`;
   const fullTitle = session.title || 'Untitled Session';
   return `
     <button class="list-item session-item ${active ? 'active' : ''} ${selected ? 'selected' : ''}" data-action="open-session" data-session-id="${session.id}" data-session-item="true" draggable="true" title="${escapeAttr(fullTitle)}">
       ${state.selectionMode ? `<span class="session-check ${selected ? 'checked' : ''}" data-action="toggle-session-select" data-session-id="${session.id}" aria-hidden="true">${selected ? '✓' : ''}</span>` : ''}
-      <span class="session-icon">${icon}</span>
+      <span class="session-icon">${sessionIcon}</span>
       <div class="list-copy">
         <div class="list-title session-list-title">${escapeHtml(fullTitle)}</div>
         <div class="list-meta">${escapeHtml(meta)}</div>
@@ -300,7 +391,7 @@ function renderBackgroundRecordingBanner() {
       </div>
       <div class="background-recording-actions">
         ${viewingRecordedSession ? '' : `<button class="ghost-btn small" data-action="jump-to-recording-session">Open recording</button>`}
-        <button class="danger-btn small" data-action="stop-recording">■ Stop</button>
+        <button class="danger-btn small" data-action="stop-recording">${icon('square')} Stop</button>
       </div>
     </div>
   `;
@@ -308,42 +399,66 @@ function renderBackgroundRecordingBanner() {
 
 function renderHome() {
   return `
+    <header class="home-topbar">
+      <div class="home-topbar-left"><button class="icon-btn main-sidebar-toggle" data-action="toggle-sidebar" title="Toggle sidebar" aria-controls="session-sidebar" aria-expanded="${state.sidebarOpen}">${icon('sidebar-simple')}</button><span>Workspace</span></div>
+      <button class="icon-btn" data-action="open-settings" title="Settings">${icon('gear-six')}</button>
+    </header>
     <section class="home-view">
       <div class="home-shell">
         <div class="home-hero">
           <h1>Start a new session</h1>
-          <p>
-            This build is already wired to the backend: session and folder management, live WebSocket transcription, meeting speaker mapping, lecture concept recaps, AI notes, action items, Q&A, export, and optional Google Drive upload.
-          </p>
+          <p>Capture the conversation. Keep the ideas, decisions, and next steps.</p>
         </div>
 
         <div class="mode-grid">
           <article class="mode-card lecture">
-            <div class="mode-badge lecture">🎓 Lecture Mode</div>
+            <div class="mode-badge lecture">${icon('graduation-cap')}</div>
             <h3>Lecture mode</h3>
-            <p>Built for classes, talks, and study sessions. The UI prioritizes concept boundaries, structured notes, and student-facing next steps.</p>
+            <p>For classes, talks, and study sessions. Turn new ideas into notes you can return to.</p>
             <div class="feature-list">
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Automatic concept recap cards</span></div>
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Cornell and class-oriented note generation</span></div>
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Homework, quiz, and reading task extraction</span></div>
-              <div class="feature-item"><span class="feature-dot lecture">✓</span><span>Screen context to interpret boards and slides</span></div>
+              <div class="feature-item">${icon('check')}<span>Concept recaps as the lecture unfolds</span></div>
+              <div class="feature-item">${icon('check')}<span>Cornell or outline notes</span></div>
+              <div class="feature-item">${icon('check')}<span>Homework, quizzes, and reading reminders</span></div>
+              <div class="feature-item">${icon('check')}<span>Context from slides and shared screens</span></div>
             </div>
-            <button class="mode-cta lecture" data-action="create-session" data-mode="lecture">Create lecture session →</button>
+            <button class="mode-cta lecture" data-action="create-session" data-mode="lecture">Create lecture session ${icon('arrow-right')}</button>
           </article>
 
           <article class="mode-card meeting">
-            <div class="mode-badge meeting">👥 Meeting Mode</div>
+            <div class="mode-badge meeting">${icon('users')}</div>
             <h3>Meeting mode</h3>
-            <p>Built for team syncs, standups, planning, and retros. The UI prioritizes speakers, decisions, and owner or deadline style action items.</p>
+            <p>For team syncs, planning, and retros. Keep the discussion and its next steps together.</p>
             <div class="feature-list">
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Speaker diarization and renaming</span></div>
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Automatic meeting minutes</span></div>
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Owner, deadline, and deliverable action items</span></div>
-              <div class="feature-item"><span class="feature-dot meeting">✓</span><span>Cross-session and cross-folder semantic Q&A</span></div>
+              <div class="feature-item">${icon('check')}<span>Speaker labels and editable names</span></div>
+              <div class="feature-item">${icon('check')}<span>Structured meeting minutes</span></div>
+              <div class="feature-item">${icon('check')}<span>Action items with owners and deadlines</span></div>
+              <div class="feature-item">${icon('check')}<span>Q&A across sessions in a folder</span></div>
             </div>
-            <button class="mode-cta meeting" data-action="create-session" data-mode="meeting">Create meeting session →</button>
+            <button class="mode-cta meeting" data-action="create-session" data-mode="meeting">Create meeting session ${icon('arrow-right')}</button>
           </article>
         </div>
+        ${renderHomeRecentSessions()}
+      </div>
+    </section>
+  `;
+}
+
+function renderHomeRecentSessions() {
+  if (!state.sessions.length) return '';
+  return `
+    <section class="home-recent">
+      <div class="home-recent-head"><h2>Recent Sessions</h2><span class="muted">Pick up where you left off</span></div>
+      <div class="home-session-list">
+        ${state.sessions.slice(0, 3).map(session => `
+          <button class="home-session" data-action="open-session" data-session-id="${session.id}" title="${escapeAttr(session.title || 'Untitled Session')}">
+            <span class="session-icon">${icon(session.mode === 'meeting' ? 'users' : 'graduation-cap')}</span>
+            <span class="list-copy">
+              <span class="list-title">${escapeHtml(session.title || 'Untitled Session')}</span>
+              <span class="list-meta">${escapeHtml(formatDate(session.created_at))} · ${escapeHtml(session.mode)}</span>
+            </span>
+            ${icon('arrow-right')}
+          </button>
+        `).join('')}
       </div>
     </section>
   `;
@@ -362,7 +477,8 @@ function renderWorkspace() {
     <section class="workspace">
       <header class="workspace-header">
         <div class="header-left">
-          <button class="icon-btn" data-action="back-home" title="Back home">←</button>
+          <button class="icon-btn main-sidebar-toggle" data-action="toggle-sidebar" title="Toggle sidebar" aria-controls="session-sidebar" aria-expanded="${state.sidebarOpen}">${icon('sidebar-simple')}</button>
+          <button class="icon-btn" data-action="back-home" title="Back home">${icon('arrow-left')}</button>
           <div class="title-wrap">
             <div class="header-meta">
               <span class="pill ${modeClass}">${escapeHtml(session.mode)}</span>
@@ -380,31 +496,31 @@ function renderWorkspace() {
 
         <div class="header-right">
           <div class="control-group">
-            <button class="toggle-btn ${state.micEnabled ? 'active' : ''}" data-action="toggle-mic" title="Toggle microphone input" aria-label="Toggle microphone input">
+            <button class="toggle-btn ${state.micEnabled ? 'active' : ''}" data-action="toggle-mic" title="Toggle microphone input" aria-label="Toggle microphone input" aria-pressed="${state.micEnabled}">
               ${renderMicToggleIcon(state.micEnabled)}
             </button>
-            <button class="toggle-btn ${state.screenEnabled ? 'active screen' : ''}" data-action="toggle-screen" title="Toggle screen analysis" aria-label="Toggle screen analysis">
+            <button class="toggle-btn ${state.screenEnabled ? 'active screen' : ''}" data-action="toggle-screen" title="Toggle screen analysis" aria-label="Toggle screen analysis" aria-pressed="${state.screenEnabled}">
               ${renderScreenToggleIcon()}
             </button>
           </div>
 
           ${!isRecording ? `
-            <button class="primary-btn" data-action="start-recording" ${recordingElsewhere ? 'disabled' : ''}>▶ Start</button>
+            <button class="primary-btn" data-action="start-recording" ${recordingElsewhere ? 'disabled' : ''}>${icon('play')} Start</button>
           ` : ''}
 
           ${isRecording ? `
-            <button class="danger-btn" data-action="stop-recording">■ Stop</button>
+            <button class="danger-btn" data-action="stop-recording">${icon('square')} Stop</button>
           ` : ''}
 
           ${session.status === 'completed' ? `
-            <button class="secondary-btn" data-action="open-export">⬇ Export</button>
+            <button class="secondary-btn" data-action="open-export">${icon('download-simple')} Export</button>
           ` : ''}
         </div>
       </header>
 
       ${state.screenEnabled && isSessionActivelyRecording(session.id) ? `
         <div class="screen-banner">
-          <div>🖥️ Screen analysis is on. The app will capture frames from the shared screen and inject the results into the AI panel.</div>
+          <div>${icon('monitor')} Screen analysis is on. Shared-screen context will be included in your notes.</div>
           <div><strong>${state.screenCaptures.length}</strong> analyzed</div>
         </div>
       ` : ''}
@@ -413,8 +529,8 @@ function renderWorkspace() {
         <section class="transcript-panel">
           <div class="panel-header">
             <div>
-              <div class="panel-title"><span class="panel-icon">📝</span><span>Live transcript</span></div>
-              <div class="panel-subtitle">System audio is the primary input and the mic can be toggled at any time.${session.mode === 'meeting' ? ' Speaker diarization is enabled in meeting mode.' : ' Concept flow is preserved in lecture mode.'}</div>
+              <div class="panel-title"><span class="panel-icon">${icon('note-pencil')}</span><span>Live transcript</span></div>
+              <div class="panel-subtitle">System audio${session.mode === 'meeting' ? ' · Speaker labels enabled' : ' · Microphone optional'}</div>
             </div>
             ${session.mode === 'meeting' ? `<button class="text-btn" data-action="open-speakers">Manage speakers</button>` : ''}
           </div>
@@ -425,13 +541,13 @@ function renderWorkspace() {
         </section>
 
         <section class="insight-panel">
-          <div class="tab-row">
-            ${renderTabButton('notes', '📄', 'AI Notes')}
-            ${renderTabButton('action_items', '✅', 'Action Items', tabBadge > 0 ? String(tabBadge) : '')}
-            ${session.mode === 'lecture' ? renderTabButton('recaps', '💡', 'Concept Recaps') : ''}
-            ${renderTabButton('qa', '💬', 'Session Q&A')}
+          <div class="tab-row" role="tablist" aria-label="Session insights">
+            ${renderTabButton('notes', 'file-text', 'AI Notes')}
+            ${renderTabButton('action_items', 'checks', 'Action Items', tabBadge > 0 ? String(tabBadge) : '')}
+            ${session.mode === 'lecture' ? renderTabButton('recaps', 'lightbulb', 'Concept Recaps') : ''}
+            ${renderTabButton('qa', 'chat-circle', 'Session Q&A')}
           </div>
-          <div class="insight-scroll">
+          <div class="insight-scroll" role="tabpanel" id="insight-content" aria-labelledby="tab-${state.activeTab}">
             ${renderInsightBody()}
           </div>
         </section>
@@ -449,9 +565,9 @@ function renderTranscriptBody() {
     return `
       <div class="empty-state">
         <div class="empty-state-card">
-          <div class="empty-emoji">🎙️</div>
+          <div class="empty-emoji">${icon('microphone')}</div>
           <div style="font-weight:700;margin-bottom:8px;">Click Start to begin live transcription</div>
-          <div class="muted">Recording requests system audio by default. The microphone is now an optional enhancement and is no longer mutually exclusive with system audio.</div>
+          <div class="muted">Share system audio to capture the session. Enable the microphone to include your voice.</div>
         </div>
       </div>
     `;
@@ -521,10 +637,10 @@ function renderTranscriptBody() {
   return `<div class="transcript-stack">${previewBanner}${lines}${partial}</div>`;
 }
 
-function renderTabButton(id, icon, label, badge = '') {
+function renderTabButton(id, iconName, label, badge = '') {
   return `
-    <button class="tab-btn ${state.activeTab === id ? 'active' : ''}" data-action="switch-tab" data-tab="${id}">
-      <span class="tab-icon">${icon}</span>
+    <button class="tab-btn ${state.activeTab === id ? 'active' : ''}" id="tab-${id}" role="tab" aria-selected="${state.activeTab === id}" aria-controls="insight-content" tabindex="${state.activeTab === id ? '0' : '-1'}" data-action="switch-tab" data-tab="${id}">
+      <span class="tab-icon">${icon(iconName)}</span>
       <span>${label}</span>
       ${badge ? `<span class="badge">${badge}</span>` : ''}
     </button>
@@ -548,7 +664,7 @@ function renderNotesTab() {
         <div class="note-toolbar">
           <div>
             <div class="note-toolbar-title">${state.currentSession?.mode === 'meeting' ? 'Meeting Minutes' : 'AI Notes'}</div>
-            <div class="muted" style="font-size:13px;margin-top:4px;">AI notes are manual now. Choose a note style first, then generate them.</div>
+            <div class="muted" style="font-size:13px;margin-top:4px;">Choose a style and generate notes from your transcript.</div>
           </div>
           <div class="note-toolbar-actions">
             ${renderNoteMethodPicker()}
@@ -556,8 +672,8 @@ function renderNotesTab() {
           </div>
         </div>
         <div class="info-callout">
-          <div>ℹ️</div>
-          <div>No AI notes have been generated for this session yet. To save tokens, notes are no longer auto-generated when recording stops. Generate them manually once a transcript exists.</div>
+          <div>${icon('info')}</div>
+          <div>Your notes will appear here. Record a session first, then generate them when you’re ready.</div>
         </div>
       </div>
     `;
@@ -585,12 +701,12 @@ function renderNoteMethodPicker() {
   const methods = state.noteMethods || [];
   if (!methods.length) return '';
   return `
-    <div class="note-method-picker" role="tablist" aria-label="Choose note style">
+    <div class="note-method-picker" role="group" aria-label="Choose note style">
       ${methods.map((method) => {
         const active = state.selectedNoteMethod === method.id;
         const shortName = method.name.replace(/\s*Method$/i, '').replace(/\s*Minutes$/i, '');
         const hint = method.id === 'cornell' ? 'Q / Notes / Summary' : method.id === 'outline' ? 'Hierarchy / Key Points' : 'Decisions / Sections';
-        return `<button class="method-chip ${active ? 'active' : ''}" data-action="select-note-method" data-method-id="${escapeAttr(method.id)}" role="tab" aria-selected="${active ? 'true' : 'false'}">
+        return `<button class="method-chip ${active ? 'active' : ''}" data-action="select-note-method" data-method-id="${escapeAttr(method.id)}" aria-pressed="${active}">
           <span class="method-chip-title">${escapeHtml(shortName)}</span>
           <span class="method-chip-hint">${escapeHtml(hint)}</span>
         </button>`;
@@ -607,8 +723,8 @@ function renderActionItemsTab() {
       ${progress}
       <div class="note-body">
         <div class="info-callout">
-          <div>💡</div>
-          <div>Action items are extracted separately from the transcript and visual context, with priority on future-facing tasks, deadlines, owners, and reminders.</div>
+          <div>${icon('lightbulb')}</div>
+          <div>Find tasks, deadlines, and reminders in your transcript and shared-screen context.</div>
         </div>
         <button class="primary-btn" data-action="generate-notes" ${state.generatingNotes ? 'disabled' : ''}>Extract action items</button>
       </div>
@@ -621,8 +737,8 @@ function renderActionItemsTab() {
     ${progress}
     <div class="note-body">
       <div class="info-callout">
-        <div>🧠</div>
-        <div>Meeting mode emphasizes owners and deliverables; lecture mode emphasizes homework, quizzes, readings, and reminders.</div>
+        <div>${icon('checks')}</div>
+        <div>Keep track of tasks, owners, deadlines, and reminders.</div>
       </div>
       <div class="action-list">
         ${items.length ? items.map(renderActionItem).join('') : `<div class="muted">No clear action items were detected.</div>`}
@@ -659,8 +775,8 @@ function renderRecapsTab() {
       ${progress}
       <div class="note-body">
         <div class="info-callout">
-          <div>💡</div>
-          <div>Concept recaps come from backend concept-boundary detection. If the lecture has not accumulated enough context yet, record a bit longer or trigger a recap manually.</div>
+          <div>${icon('lightbulb')}</div>
+          <div>Recaps group related ideas from your lecture. Record some context, then generate a recap.</div>
         </div>
         <button class="primary-btn" data-action="generate-recap" ${isProgressActive('recaps') ? 'disabled' : ''}>Generate concept recap</button>
       </div>
@@ -674,7 +790,7 @@ function renderRecapsTab() {
       ${recaps.map((recap) => `
         <article class="recap-card">
           <div class="recap-head">
-            <div class="recap-title">📘 ${escapeHtml(recap.topic_label || 'Concept')}</div>
+            <div class="recap-title">${icon('book-open')} ${escapeHtml(recap.topic_label || 'Concept')}</div>
             <div class="recap-meta">${formatDuration(recap.start_time || 0)} → ${formatDuration(recap.end_time || 0)}</div>
           </div>
           <div class="recap-body note-markdown">${markdownToHtml(recap.content || recap.summary || '')}</div>
@@ -693,7 +809,7 @@ function renderQATab() {
         ${state.qaMessages.length ? state.qaMessages.map(renderChatMessage).join('') : `
           <div class="chat-row assistant">
             <div class="chat-bubble">
-              Hi! The live backend Q&A endpoint is already connected. Ask about the current session, or search across sessions automatically when a folder is selected.
+              Ask about this session. Sessions in the same folder are included automatically.
             </div>
           </div>
         `}
@@ -701,7 +817,7 @@ function renderQATab() {
 
       <div class="qa-compose">
         <form class="qa-form" data-action="ask-question-form">
-          <textarea data-model="qaInput" placeholder="For example: When did the team decide to ship beta? Or: What is the difference between supervised and unsupervised learning in this lecture?">${escapeHtml(state.qaInput)}</textarea>
+          <textarea data-model="qaInput" aria-label="Ask about this session" placeholder="Ask a question about this session…">${escapeHtml(state.qaInput)}</textarea>
           <button class="primary-btn" type="submit" ${state.askingQuestion ? 'disabled' : ''}>
             ${state.askingQuestion ? 'Thinking…' : 'Send'}
           </button>
@@ -741,19 +857,19 @@ function renderExportModal() {
             <div class="modal-title">Export session</div>
             <div class="muted" style="margin-top:6px;font-size:13px;">Download locally, or upload directly to Google Drive when the active account is signed in with Google.</div>
           </div>
-          <button class="icon-btn" data-action="close-export" ${state.exportBusy ? 'disabled' : ''}>×</button>
+          <button class="icon-btn" data-action="close-export" ${state.exportBusy ? 'disabled' : ''}>${icon('x')}</button>
         </div>
         <div class="modal-body">
           <div class="field-group">
             <div class="field-label">1. Choose a format</div>
             <div class="option-grid">
               <button type="button" class="export-option ${state.exportFormat === 'pdf' ? 'selected' : ''}" data-action="pick-export-format" data-format="pdf" ${state.exportBusy ? 'disabled' : ''}>
-                <div>📄</div>
+                <div>${icon('file-text')}</div>
                 <div class="option-title">PDF</div>
                 <div class="option-desc">Best for reading, sharing, and archiving</div>
               </button>
               <button type="button" class="export-option ${state.exportFormat === 'docx' ? 'selected' : ''}" data-action="pick-export-format" data-format="docx" ${state.exportBusy ? 'disabled' : ''}>
-                <div>📝</div>
+                <div>${icon('note-pencil')}</div>
                 <div class="option-title">DOCX</div>
                 <div class="option-desc">Best for editing later</div>
               </button>
@@ -764,12 +880,12 @@ function renderExportModal() {
             <div class="field-label">2. Choose a destination</div>
             <div class="option-grid">
               <button type="button" class="export-option ${state.exportDestination === 'download' ? 'selected' : ''}" data-action="pick-export-destination" data-destination="download" ${state.exportBusy ? 'disabled' : ''}>
-                <div>⬇</div>
+                <div>${icon('download-simple')}</div>
                 <div class="option-title">Download locally</div>
-                <div class="option-desc">Export from the backend and download it</div>
+                <div class="option-desc">Save a copy to your device</div>
               </button>
               <button type="button" class="export-option ${state.exportDestination === 'drive' ? 'selected' : ''}" data-action="pick-export-destination" data-destination="drive" ${state.exportBusy ? 'disabled' : ''}>
-                <div>☁️</div>
+                <div>${icon('cloud-arrow-up')}</div>
                 <div class="option-title">Upload to Google Drive</div>
                 <div class="option-desc">${escapeHtml(getDriveExportDescription())}</div>
               </button>
@@ -799,9 +915,9 @@ function renderSpeakerModal() {
         <div class="modal-head">
           <div>
             <div class="modal-title">Speaker mapping</div>
-            <div class="muted" style="margin-top:6px;font-size:13px;">Changes will be written back to the backend and used for later transcript labels.</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Name each speaker to make your transcript easier to follow.</div>
           </div>
-          <button class="icon-btn" data-action="close-speakers">×</button>
+          <button class="icon-btn" data-action="close-speakers">${icon('x')}</button>
         </div>
         <div class="modal-body">
           ${keys.length ? keys.map((key) => `
@@ -835,7 +951,7 @@ function renderConfirmModal() {
             <div class="modal-title">${escapeHtml(dialog.title || 'Confirm action')}</div>
             <div class="muted" style="margin-top:6px;font-size:13px;">${escapeHtml(dialog.message || 'Are you sure you want to continue?')}</div>
           </div>
-          <button class="icon-btn" data-action="close-confirm">×</button>
+          <button class="icon-btn" data-action="close-confirm">${icon('x')}</button>
         </div>
         <div class="modal-foot">
           <button class="ghost-btn" data-action="close-confirm">${escapeHtml(dialog.cancelLabel || 'Cancel')}</button>
@@ -866,9 +982,9 @@ function renderSessionContextMenu() {
   return `
     <div class="context-menu" style="left:${Math.max(12, menu.x)}px;top:${Math.max(12, menu.y)}px;">
       <div class="context-menu-header">${escapeHtml(compactTitle(session.title || 'Untitled Session', 34))}</div>
-      <button class="context-menu-item" data-action="context-ai-rename" data-session-id="${session.id}">✨ AI rename</button>
-      <button class="context-menu-item" data-action="context-move-session" data-session-id="${session.id}">📁 Move to folder</button>
-      <button class="context-menu-item danger" data-action="context-delete-session" data-session-id="${session.id}">🗑 Delete</button>
+      <button class="context-menu-item" data-action="context-ai-rename" data-session-id="${session.id}">${icon('sparkle')} AI rename</button>
+      <button class="context-menu-item" data-action="context-move-session" data-session-id="${session.id}">${icon('folder')} Move to folder</button>
+      <button class="context-menu-item danger" data-action="context-delete-session" data-session-id="${session.id}">${icon('trash')} Delete</button>
     </div>
   `;
 }
@@ -881,9 +997,9 @@ function renderFolderModal() {
         <div class="modal-head">
           <div>
             <div class="modal-title">New folder</div>
-            <div class="muted" style="margin-top:6px;font-size:13px;">Give the folder a clearer name and color so drag-and-drop and bulk move actions are easier later.</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Organize related sessions with a name and a color.</div>
           </div>
-          <button class="icon-btn" data-action="close-folder-modal">×</button>
+          <button class="icon-btn" data-action="close-folder-modal">${icon('x')}</button>
         </div>
         <div class="modal-body custom-scrollbar">
           <div class="field-group">
@@ -929,12 +1045,12 @@ function renderMoveModal() {
             <div class="modal-title">Move sessions</div>
             <div class="muted" style="margin-top:6px;font-size:13px;">Move ${selectedCount} session${selectedCount === 1 ? '' : 's'} to a folder, or drag a single session into a folder from the sidebar.</div>
           </div>
-          <button class="icon-btn" data-action="close-move-modal">×</button>
+          <button class="icon-btn" data-action="close-move-modal">${icon('x')}</button>
         </div>
         <div class="modal-body">
           <div class="move-list">
             <button class="move-option ${state.moveTargetFolderId === '' ? 'active' : ''}" data-action="pick-move-target" data-folder-id="">
-              <span class="folder-icon">🗂️</span>
+              <span class="folder-icon">${icon('folders')}</span>
               <div class="list-copy">
                 <div class="list-title">All sessions / no folder</div>
                 <div class="list-meta">Remove from any folder</div>
@@ -1043,8 +1159,8 @@ function renderSettingsModal() {
   const activeAccount = getActiveAccount();
   const plans = [
     { id: 'free', name: 'Free', meta: 'Current default', desc: 'Keeps the current core recording, transcription, and export features.' },
-    { id: 'pro', name: 'Pro', meta: 'Coming soon', desc: 'Can later add higher limits, more AI workflows, and cross-device sync.' },
-    { id: 'team', name: 'Team', meta: 'Coming soon', desc: 'Can later add collaboration, shared spaces, and org-level controls.' },
+    { id: 'pro', name: 'Pro', meta: 'Coming soon', desc: 'Higher limits and more AI workflows.' },
+    { id: 'team', name: 'Team', meta: 'Coming soon', desc: 'Shared spaces and collaboration tools.' },
   ];
 
   return `
@@ -1055,7 +1171,7 @@ function renderSettingsModal() {
             <div class="modal-title">Settings</div>
             <div class="muted" style="margin-top:6px;font-size:13px;">Choose AI models, configure Google Drive, and manage your preferences.</div>
           </div>
-          <button class="icon-btn" data-action="close-settings">×</button>
+          <button class="icon-btn" data-action="close-settings">${icon('x')}</button>
         </div>
         <div class="modal-body custom-scrollbar settings-body">
           ${renderModelSettings()}
@@ -1115,7 +1231,7 @@ function renderSettingsModal() {
                 <input class="text-input" data-model="email-address" value="${escapeAttr(state.emailAccountDraft.email || '')}" placeholder="you@example.com" />
               </div>
               <div class="email-form-foot">
-                <div class="muted">With email login, the avatar uses the first letter of the first name plus the last letter of the last name by default.</div>
+                <div class="muted">Your name and email identify this account on this device.</div>
                 <button class="primary-btn" type="submit">Add email account</button>
               </div>
             </form>
@@ -1125,7 +1241,7 @@ function renderSettingsModal() {
             <div class="settings-section-head">
               <div>
                 <div class="settings-section-title">Plan</div>
-                <div class="muted">This version includes a presentational plan panel. Payment can be connected later.</div>
+                <div class="muted">Core features are included. Pro and Team plans are coming soon.</div>
               </div>
             </div>
             <div class="plan-grid">
@@ -1145,17 +1261,17 @@ function renderSettingsModal() {
             <div class="settings-section-head">
               <div>
                 <div class="settings-section-title">Theme</div>
-                <div class="muted">Light and dark themes are available. Light remains the default.</div>
+                <div class="muted">Choose the appearance that feels comfortable to you.</div>
               </div>
             </div>
             <div class="option-grid theme-grid">
               <button type="button" class="export-option ${state.theme === 'light' ? 'selected' : ''}" data-action="pick-theme" data-theme="light">
-                <div>☀️</div>
+                <div>${icon('sun')}</div>
                 <div class="option-title">Light</div>
-                <div class="option-desc">Current default theme</div>
+                <div class="option-desc">A bright, clear workspace</div>
               </button>
               <button type="button" class="export-option ${state.theme === 'dark' ? 'selected' : ''}" data-action="pick-theme" data-theme="dark">
-                <div>🌙</div>
+                <div>${icon('moon')}</div>
                 <div class="option-title">Dark</div>
                 <div class="option-desc">Dark mode</div>
               </button>
@@ -1288,6 +1404,7 @@ async function handleClick(event) {
         await stopRecording();
         break;
       case 'switch-tab':
+        if (state.activeTab === actionEl.dataset.tab) break;
         state.activeTab = actionEl.dataset.tab;
         scheduleRender();
         break;
@@ -1606,6 +1723,7 @@ async function openSession(sessionId, options = {}) {
   state.loadingSession = true;
   state.transcriptExpanded = false;
   state.view = 'session';
+  if (window.matchMedia('(max-width: 767px)').matches) state.sidebarOpen = false;
   state.expandedScreenCaptures = {};
 
   const cached = state.sessions.find((item) => item.id === sessionId);
@@ -2924,14 +3042,7 @@ function renderProgressPanel(key, title) {
   const progress = state.progress[key];
   if (!progress || (progress.status === 'idle' && !progress.active)) {
     return `
-      <div class="progress-panel">
-        <div class="progress-head">
-          <div class="progress-title">${escapeHtml(title)}</div>
-          <div class="progress-status idle">Ready</div>
-        </div>
-        <div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div>
-        <div class="progress-caption">Waiting for you to start it.</div>
-      </div>
+      <div class="progress-panel idle">${icon('sparkle')}<span>${escapeHtml(title)} · Ready</span></div>
     `;
   }
   return `
@@ -2947,29 +3058,11 @@ function renderProgressPanel(key, title) {
 }
 
 function renderMicToggleIcon(isOn) {
-  return `
-    <span class="icon-svg ${isOn ? 'on' : 'off'}" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 1 1-6 0V6a3 3 0 0 1 3-3Z"></path>
-        <path d="M19 11a7 7 0 0 1-14 0"></path>
-        <path d="M12 18v3"></path>
-        <path d="M8 21h8"></path>
-        ${isOn ? '' : '<path d="M4 4l16 16"></path>'}
-      </svg>
-    </span>
-  `;
+  return icon(isOn ? 'microphone' : 'microphone-slash');
 }
 
 function renderScreenToggleIcon() {
-  return `
-    <span class="icon-svg" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-        <rect x="3" y="4" width="18" height="12" rx="2"></rect>
-        <path d="M8 20h8"></path>
-        <path d="M12 16v4"></path>
-      </svg>
-    </span>
-  `;
+  return icon('monitor');
 }
 
 function captureFocusState() {
@@ -2977,7 +3070,13 @@ function captureFocusState() {
   if (!active || !app.contains(active)) return null;
   const stateObj = {
     tagName: active.tagName,
+    id: active.id || '',
+    scope: active.closest('.main') ? '.main' : active.closest('.sidebar') ? '.sidebar' : active.closest('.settings-modal') ? '.settings-modal' : '',
     model: active.dataset?.model || '',
+    action: active.dataset?.action || '',
+    tab: active.dataset?.tab || '',
+    methodId: active.dataset?.methodId || '',
+    accountId: active.dataset?.accountId || '',
     sessionId: active.dataset?.sessionId || '',
     speakerKey: active.dataset?.speakerKey || '',
     selectionStart: typeof active.selectionStart === 'number' ? active.selectionStart : null,
@@ -2989,11 +3088,20 @@ function captureFocusState() {
 function restoreFocusState(focusState) {
   if (!focusState) return;
   let selector = '';
-  if (focusState.model) selector = `[data-model="${cssEscape(focusState.model)}"]`;
+  if (focusState.id) selector = `#${cssEscape(focusState.id)}`;
+  else if (focusState.model) selector = `[data-model="${cssEscape(focusState.model)}"]`;
   else if (focusState.speakerKey) selector = `[data-speaker-key="${cssEscape(focusState.speakerKey)}"]`;
+  else if (focusState.action) {
+    selector = `[data-action="${cssEscape(focusState.action)}"]`;
+    for (const [key, value] of [['data-tab', focusState.tab], ['data-method-id', focusState.methodId], ['data-session-id', focusState.sessionId], ['data-account-id', focusState.accountId]]) {
+      if (value) selector += `[${key}="${cssEscape(value)}"]`;
+    }
+  }
   if (!selector) return;
+  if (focusState.scope) selector = `${focusState.scope} ${selector}`;
 
-  const target = app.querySelector(selector);
+  const target = [...app.querySelectorAll(selector)].find(element => !element.closest('[inert]') && element.checkVisibility() && getComputedStyle(element).visibility === 'visible')
+    || (focusState.action === 'toggle-sidebar' ? app.querySelector('.main-sidebar-toggle') : null);
   if (!target) return;
   target.focus({ preventScroll: true });
   if (focusState.sessionId && target.dataset.sessionId !== focusState.sessionId) return;
@@ -3072,7 +3180,28 @@ async function handleDrop(event) {
 }
 
 function handleKeyDown(event) {
+  const tab = event.target.closest?.('.tab-btn');
+  if (tab && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+    event.preventDefault();
+    const tabs = [...app.querySelectorAll('.tab-btn')];
+    const index = tabs.indexOf(tab);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+      : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[next].focus({ preventScroll: true });
+    tabs[next].click();
+    return;
+  }
+  const focusScope = [...app.querySelectorAll('.modal')].at(-1) || (state.sidebarOpen && window.matchMedia('(max-width: 767px)').matches ? app.querySelector('.sidebar') : null);
+  if (event.key === 'Tab' && focusScope) {
+    const controls = [...focusScope.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]')]
+      .filter(element => element.getClientRects().length && !element.closest('[inert]'));
+    const first = controls[0];
+    const last = controls.at(-1);
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  }
   if (event.key === 'Escape') {
+    if (state.confirmDialog) { resolveConfirmation(false); return; }
     let changed = false;
     if (state.sessionContextMenu.visible) {
       closeContextMenu();
@@ -3102,6 +3231,10 @@ function handleKeyDown(event) {
       resolveConfirmation(false);
       return;
     }
+    if (!changed && state.sidebarOpen && window.matchMedia('(max-width: 767px)').matches) {
+      state.sidebarOpen = false;
+      changed = true;
+    }
     if (changed) scheduleRender();
   }
 }
@@ -3129,7 +3262,7 @@ function hydrateClientPreferences() {
   }
 
   state.activeAccountId = localStorage.getItem(ACTIVE_ACCOUNT_STORAGE_KEY) || '';
-  state.theme = localStorage.getItem(THEME_STORAGE_KEY) || 'light';
+  state.theme = localStorage.getItem(THEME_STORAGE_KEY) || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 
   if (state.activeAccountId && !state.accounts.some((account) => account.id === state.activeAccountId)) {
     state.activeAccountId = '';
@@ -3160,7 +3293,7 @@ function getAccountDisplayName(account) {
 }
 
 function getAccountInitials(account) {
-  if (!account) return 'JP';
+  if (!account) return 'N';
   if (account.type === 'email') {
     const first = (account.firstName || account.displayName || account.email || 'U').trim();
     const last = (account.lastName || '').trim();
