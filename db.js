@@ -272,10 +272,15 @@ export function updateNoteContent(id, content) {
 }
 
 // ── Cross-session RAG ──
+function escapeLikePattern(w) {
+  return `%${w.replace(/[\\%_]/g, '\\$&')}%`;
+}
+
 export function searchChunksInFolder(folderId, keywords) {
   const words = keywords.toLowerCase().split(/\s+/).filter(w => w.length > 2);
   if (words.length === 0) return [];
-  const conditions = words.map(w => `LOWER(tc.text) LIKE '%${w.replace(/'/g, "''")}%'`).join(' OR ');
+  const conditions = words.map(() => `LOWER(tc.text) LIKE ? ESCAPE '\\'`).join(' OR ');
+  const likeParams = words.map(escapeLikePattern);
   const sql = folderId
     ? `SELECT tc.*, s.title as session_title FROM transcript_chunks tc
        JOIN sessions s ON tc.session_id = s.id
@@ -285,14 +290,15 @@ export function searchChunksInFolder(folderId, keywords) {
        JOIN sessions s ON tc.session_id = s.id
        WHERE (${conditions})
        ORDER BY tc.start_time ASC LIMIT 100`;
-  return folderId ? all(sql, [folderId]) : all(sql);
+  return folderId ? all(sql, [folderId, ...likeParams]) : all(sql, likeParams);
 }
 
 export function searchChunks(sessionId, keywords) {
   const words = keywords.toLowerCase().split(/\s+/).filter(w => w.length > 2);
   if (words.length === 0) return getAllChunks(sessionId);
-  const conditions = words.map(w => `LOWER(text) LIKE '%${w.replace(/'/g, "''")}%'`).join(' OR ');
-  return all(`SELECT * FROM transcript_chunks WHERE session_id = ? AND (${conditions}) ORDER BY start_time ASC`, [sessionId]);
+  const conditions = words.map(() => `LOWER(text) LIKE ? ESCAPE '\\'`).join(' OR ');
+  const likeParams = words.map(escapeLikePattern);
+  return all(`SELECT * FROM transcript_chunks WHERE session_id = ? AND (${conditions}) ORDER BY start_time ASC`, [sessionId, ...likeParams]);
 }
 
 export function getFolderChunks(folderId, limit = 200) {
