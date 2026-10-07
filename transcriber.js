@@ -9,7 +9,7 @@ const DEEPGRAM_WS_URL = 'wss://api.deepgram.com/v1/listen';
  */
 export function createTranscriber(apiKey, options = {}) {
   const {
-    model = 'nova-2',
+    model = 'nova-3',
     language = 'en',
     smart_format = true,
     punctuate = true,

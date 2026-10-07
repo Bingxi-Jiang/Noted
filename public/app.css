@@ -1983,3 +1983,8 @@ input, textarea, select {
     justify-content: flex-start;
   }
 }
+/* Model and export settings reuse the existing settings form layout. */
+.model-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.settings-key-status { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.model-fields .muted { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.model-fields select.text-input { width: 100%; }

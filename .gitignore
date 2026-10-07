@@ -39,3 +39,7 @@ logs/
 *.tmp
 *.temp
 transcription.db
+
+# Local model/provider preferences
+settings.local.json
+settings.local.json.tmp

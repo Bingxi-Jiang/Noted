@@ -3,7 +3,7 @@ import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { v4 as uuid } from 'uuid';
+import { randomUUID as uuid } from 'node:crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -24,24 +24,52 @@ import {
   detectConceptBoundary, generateConceptRecap, extractActionItems
 } from './summarizer.js';
 
+import { getSettings, publicSettings, saveSettings, getAIConfig, hasAIKey, hasKey, missingKeyMessage } from './settings.js';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
-const DEEPGRAM_KEY = process.env.DEEPGRAM_API_KEY;
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const DEEPGRAM_KEY = hasKey('DEEPGRAM_API_KEY') ? process.env.DEEPGRAM_API_KEY.trim() : '';
+
 
 if (!DEEPGRAM_KEY || DEEPGRAM_KEY === 'your_deepgram_api_key_here')
   console.warn('\n⚠️  DEEPGRAM_API_KEY not set — transcription won\'t work.\n');
-if (!GEMINI_KEY || GEMINI_KEY === 'your_gemini_api_key_here')
-  console.warn('\n⚠️  GEMINI_API_KEY not set — AI features won\'t work.\n');
+if (!hasAIKey()) console.warn(missingKeyMessage());
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
+// ws forwards HTTP server errors, including failures to bind the listening port.
+wss.on('error', err => {
+  if (server.listening) {
+    console.error('[WebSocket]', err.message);
+    return;
+  }
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[Server] Port ${PORT} is already in use. Stop the existing server or choose another PORT in .env, then run npm run dev again.`);
+  } else {
+    console.error(`[Server] Unable to start (${err.code || 'error'}): ${err.message}`);
+  }
+  // Let pending handles finish closing instead of forcing Node to exit.
+  process.exitCode = 1;
+  wss.close();
+});
 await initDB();
 
 const activeSessions = new Map();
+
+app.get('/api/settings', (req, res) => res.json(publicSettings()));
+app.put('/api/settings', (req, res) => {
+  // Settings belong to this local installation; reject writes from other sites.
+  if (req.get('origin') && req.get('origin') !== req.protocol + '://' + req.get('host')) {
+    return res.status(403).json({ error: 'Settings can only be changed from Noted.' });
+  }
+  try { res.json(saveSettings(req.body)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/health', (req, res) => res.json({ ok: true, node: process.version }));
+
 
 
 function logActionItemsExtraction(sessionId, sessionMode, actionItemsMarkdown, actionItemsLog) {
@@ -129,7 +157,7 @@ app.get('/api/sessions/:id/screen-captures', (req, res) => {
 });
 
 app.post('/api/sessions/:id/screen-capture', async (req, res) => {
-  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  if (!hasAIKey('vision')) return res.status(503).json({ error: missingKeyMessage('vision') });
   try {
     const sid = req.params.id;
     const { image, capture_time, mime_type, recent_transcript } = req.body;
@@ -138,8 +166,8 @@ app.post('/api/sessions/:id/screen-capture', async (req, res) => {
     const captureTime = capture_time || 0;
     const mimeType = mime_type || 'image/jpeg';
 
-    // Analyze with Gemini Vision
-    const analysis = await analyzeScreenCapture(GEMINI_KEY, image, recent_transcript || '', mimeType);
+    // Analyze using the selected vision provider
+    const analysis = await analyzeScreenCapture(getAIConfig('vision'), image, recent_transcript || '', mimeType);
 
     // Store in DB (without the full image to save space — just the analysis)
     // Keep a small thumbnail reference if needed later
@@ -179,7 +207,7 @@ app.get('/api/sessions/:id/summaries', (req, res) => res.json(getSummaries(req.p
 app.post('/api/sessions/:id/ask', async (req, res) => {
   const { question } = req.body;
   if (!question) return res.status(400).json({ error: 'question required' });
-  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  if (!hasAIKey()) return res.status(503).json({ error: missingKeyMessage() });
   try {
     const sid = req.params.id;
     const session = getSession(sid);
@@ -194,7 +222,7 @@ app.post('/api/sessions/:id/ask', async (req, res) => {
       context = relevant.length > 0 ? relevant : getAllChunks(sid).slice(-50);
       summaries = getSummaries(sid);
     }
-    const answer = await answerQuestion(GEMINI_KEY, question, context, summaries, crossSession);
+    const answer = await answerQuestion(getAIConfig('text'), question, context, summaries, crossSession);
     res.json({ answer, sources: context.slice(0, 10).map(c => ({
       text: c.text, start_time: c.start_time, end_time: c.end_time,
       session_title: c.session_title || null
@@ -208,12 +236,12 @@ app.post('/api/sessions/:id/ask', async (req, res) => {
 app.post('/api/folders/:id/ask', async (req, res) => {
   const { question } = req.body;
   if (!question) return res.status(400).json({ error: 'question required' });
-  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  if (!hasAIKey()) return res.status(503).json({ error: missingKeyMessage() });
   try {
     let context = searchChunksInFolder(req.params.id, question);
     if (context.length === 0) context = getFolderChunks(req.params.id, 100);
     const summaries = getFolderSummaries(req.params.id);
-    const answer = await answerQuestion(GEMINI_KEY, question, context, summaries, true);
+    const answer = await answerQuestion(getAIConfig('text'), question, context, summaries, true);
     res.json({ answer, sources: context.slice(0, 10).map(c => ({
       text: c.text, start_time: c.start_time, session_title: c.session_title
     }))});
@@ -225,7 +253,7 @@ app.post('/api/folders/:id/ask', async (req, res) => {
 
 // ══════════════ Concept Recap (manual trigger) ══════════════
 app.post('/api/sessions/:id/concept-recap', async (req, res) => {
-  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  if (!hasAIKey()) return res.status(503).json({ error: missingKeyMessage() });
   try {
     const sid = req.params.id;
     const chunks = getAllChunks(sid);
@@ -236,7 +264,7 @@ app.post('/api/sessions/:id/concept-recap', async (req, res) => {
     const existingSummaries = getSummaries(sid).filter(s => s.summary_type === 'concept');
     const existingConcepts = existingSummaries.map(s => s.topic_label).filter(Boolean);
 
-    const boundary = await detectConceptBoundary(GEMINI_KEY, recent, existingConcepts);
+    const boundary = await detectConceptBoundary(getAIConfig('text'), recent, existingConcepts);
     if (!boundary.changed || !boundary.concept_title) {
       return res.json({ skipped: true, reason: 'No clear concept boundary detected in recent content.' });
     }
@@ -250,7 +278,7 @@ app.post('/api/sessions/:id/concept-recap', async (req, res) => {
 
     const startTime = conceptChunks[0].start_time;
     const endTime = conceptChunks[conceptChunks.length - 1].end_time;
-    const recap = await generateConceptRecap(GEMINI_KEY, conceptChunks, boundary.concept_title);
+    const recap = await generateConceptRecap(getAIConfig('text'), conceptChunks, boundary.concept_title);
 
     insertSummary(sid, recap, startTime, endTime, 'concept', boundary.concept_title);
     broadcastToSession(sid, {
@@ -276,7 +304,7 @@ app.get('/api/sessions/:id/notes', (req, res) => {
 });
 
 app.post('/api/sessions/:id/notes/generate', async (req, res) => {
-  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  if (!hasAIKey()) return res.status(503).json({ error: missingKeyMessage() });
   try {
     const sid = req.params.id;
     const session = getSession(sid);
@@ -291,8 +319,8 @@ app.post('/api/sessions/:id/notes/generate', async (req, res) => {
     const summaries = getSummaries(sid);
     const speakerNameMap = sessionMode === 'meeting' ? getSpeakerNameMap(sid) : {};
     const screenCaptures = getScreenCaptures(sid);
-    const content = await generateNotes(GEMINI_KEY, chunks, summaries, method, speakerNameMap, screenCaptures);
-    const actionItemsResult = await extractActionItems(GEMINI_KEY, chunks, sessionMode, speakerNameMap, screenCaptures);
+    const content = await generateNotes(getAIConfig('text'), chunks, summaries, method, speakerNameMap, screenCaptures);
+    const actionItemsResult = await extractActionItems(getAIConfig('text'), chunks, sessionMode, speakerNameMap, screenCaptures);
     const actionItemsLogText = JSON.stringify(actionItemsResult.log, null, 2);
     logActionItemsExtraction(sid, sessionMode, actionItemsResult.actionItemsMarkdown, actionItemsResult.log);
     const noteId = uuid();
@@ -356,11 +384,11 @@ app.get('/api/sessions/:id/export/:format', async (req, res) => {
 
 // ══════════════ Auto-title ══════════════
 app.post('/api/sessions/:id/auto-title', async (req, res) => {
-  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
+  if (!hasAIKey()) return res.status(503).json({ error: missingKeyMessage() });
   try {
     const chunks = getAllChunks(req.params.id);
     if (chunks.length === 0) return res.json({ title: 'Empty Session' });
-    const title = await generateSessionTitle(GEMINI_KEY, chunks);
+    const title = await generateSessionTitle(getAIConfig('text'), chunks);
     updateSession(req.params.id, { title: title.trim() });
     res.json({ title: title.trim() });
   } catch (err) {
@@ -415,6 +443,7 @@ wss.on('connection', (ws) => {
           // Enable diarization for meeting mode
           const useDiarize = sessionMode === 'meeting';
           transcriber = createTranscriber(DEEPGRAM_KEY, {
+            ...getSettings().deepgram,
             interim_results: true,
             smart_format: true,
             utterance_end_ms: 1500,
@@ -481,7 +510,7 @@ wss.on('connection', (ws) => {
           transcriber = session.transcriber;
           ws.send(JSON.stringify({ type: 'session_ready', session_id: sessionId }));
         } else {
-          ws.send(JSON.stringify({ type: 'session_ready', session_id: sessionId }));
+          ws.send(JSON.stringify({ type: 'error', data: { message: 'Set DEEPGRAM_API_KEY in .env, then restart Noted.' } }));
         }
       }
       else if (msg.type === 'stop_session') { stopSession(sessionId); }
@@ -498,7 +527,7 @@ wss.on('connection', (ws) => {
 });
 
 async function maybeAutoSummarize(sessionId, session, currentTime) {
-  if (!GEMINI_KEY) return;
+  if (!hasAIKey()) return;
 
   // ── Concept Recap Detection ──
   // Only check every 15 chunks, and enforce minimum 2 minutes between concepts
@@ -515,14 +544,14 @@ async function maybeAutoSummarize(sessionId, session, currentTime) {
     const recent = getRecentChunks(sessionId, 180);
     if (recent.length < 5) { session.conceptCheckPending = false; return; }
 
-    const boundary = await detectConceptBoundary(GEMINI_KEY, recent, session.detectedConcepts);
+    const boundary = await detectConceptBoundary(getAIConfig('text'), recent, session.detectedConcepts);
 
     if (boundary.changed && boundary.concept_title) {
       // Get chunks since last concept for the recap content
       const conceptChunks = getChunks(sessionId, session.lastConceptTime, currentTime);
       if (conceptChunks.length < 3) { session.conceptCheckPending = false; return; }
 
-      const recap = await generateConceptRecap(GEMINI_KEY, conceptChunks, boundary.concept_title);
+      const recap = await generateConceptRecap(getAIConfig('text'), conceptChunks, boundary.concept_title);
 
       // Store as a summary with type 'concept'
       insertSummary(sessionId, recap, session.lastConceptTime, currentTime, 'concept', boundary.concept_title);
@@ -563,8 +592,8 @@ function stopSession(sessionId) {
   const dbSession = getSession(sessionId);
 
   // Keep auto-title, but AI notes/action items are now manual-only to save tokens.
-  if (GEMINI_KEY && dbSession?.title?.startsWith('Session ')) {
-    generateSessionTitle(GEMINI_KEY, chunks).then(title => {
+  if (hasAIKey() && dbSession?.title?.startsWith('Session ')) {
+    generateSessionTitle(getAIConfig('text'), chunks).then(title => {
       updateSession(sessionId, { title: title.trim(), status: 'completed' });
       broadcastToSession(sessionId, { type: 'session_updated', data: { title: title.trim(), status: 'completed' } });
     }).catch(e => {
@@ -578,7 +607,7 @@ function stopSession(sessionId) {
   }
 }
 
-server.listen(PORT, () => {
+server.listen(PORT, process.env.HOST || '127.0.0.1', () => {
   console.log(`\n🎙️  SCRIBE — Real-Time Transcription`);
-  console.log(`   http://localhost:${PORT}\n`);
+  console.log(`   http://localhost:${server.address().port}\n`);
 });

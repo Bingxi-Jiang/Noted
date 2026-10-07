@@ -1,100 +1,9 @@
-// summarizer.js — Summaries, Q&A, note generation, auto-titling via Gemini
+// Summaries, Q&A, notes, and screen analysis via the selected AI provider.
+import { generateAI } from './ai-client.js';
 
-const GEMINI_MODEL = 'gemini-3-flash-preview';
-const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-
-function extractTextFromGeminiResponse(data) {
-  const parts = data?.candidates?.[0]?.content?.parts ?? [];
-  return parts
-    .map((part) => part?.text || '')
-    .join('')
-    .trim();
-}
-
-async function callGemini(
-  apiKey,
-  systemPrompt,
-  userMessage,
-  {
-    maxOutputTokens = 1024,
-    thinkingLevel = 'low',
-    responseMimeType,
-  } = {},
-) {
-  const body = {
-    systemInstruction: {
-      parts: [{ text: systemPrompt }],
-    },
-    contents: [{
-      role: 'user',
-      parts: [{ text: userMessage }],
-    }],
-    generationConfig: {
-      maxOutputTokens,
-      thinkingConfig: {
-        thinkingLevel,
-      },
-    },
-  };
-
-  if (responseMimeType) {
-    body.generationConfig.responseMimeType = responseMimeType;
-  }
-
-  const res = await fetch(GEMINI_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': apiKey,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${err}`);
-  }
-
-  const data = await res.json();
-  const text = extractTextFromGeminiResponse(data);
-  if (!text) {
-    throw new Error('Gemini returned an empty response.');
-  }
-  return text;
-}
-
-// ── Vision: call Gemini with image ──
-async function callGeminiWithImage(apiKey, systemPrompt, textMessage, imageBase64, mimeType = 'image/jpeg', { maxOutputTokens = 1024, thinkingLevel = 'low' } = {}) {
-  const body = {
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    contents: [{
-      role: 'user',
-      parts: [
-        { inline_data: { mime_type: mimeType, data: imageBase64 } },
-        { text: textMessage },
-      ],
-    }],
-    generationConfig: {
-      maxOutputTokens,
-      thinkingConfig: { thinkingLevel },
-    },
-  };
-
-  const res = await fetch(GEMINI_API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Gemini Vision API error ${res.status}: ${err}`);
-  }
-
-  const data = await res.json();
-  const text = extractTextFromGeminiResponse(data);
-  if (!text) throw new Error('Gemini Vision returned an empty response.');
-  return text;
+const callAI = generateAI;
+function callAIWithImage(config, system, text, imageBase64, mimeType = 'image/jpeg', options = {}) {
+  return generateAI(config, system, text, { ...options, imageBase64, mimeType, responseMimeType: 'application/json' });
 }
 
 // ── Analyze screen capture ──
@@ -120,7 +29,7 @@ Output in this JSON format:
     ? `Analyze this screenshot. Recent audio transcript for context:\n"${recentTranscript.substring(0, 500)}"\n\nExtract all visible information.`
     : `Analyze this screenshot and extract all visible information.`;
 
-  const raw = await callGeminiWithImage(apiKey, system, prompt, imageBase64, mimeType, {
+  const raw = await callAIWithImage(apiKey, system, prompt, imageBase64, mimeType, {
     maxOutputTokens: 1024,
     thinkingLevel: 'low',
   });
@@ -371,7 +280,7 @@ If a previous summary is provided, extend it with only genuinely new information
     ? `Previous summary:\n${previousSummary}\n\n---\nNew transcript:\n${transcript}\n\nUpdate the summary with new content only.`
     : `Summarize this transcript:\n${transcript}`;
 
-  return callGemini(apiKey, system, prompt, {
+  return callAI(apiKey, system, prompt, {
     maxOutputTokens: 1024,
     thinkingLevel: 'low',
   });
@@ -399,7 +308,7 @@ When in doubt, output changed=false.
 Respond with JSON only:
 {"changed": true/false, "concept_title": "short title of the completed concept", "reason": "why you detected a boundary"}`;
 
-  const raw = await callGemini(
+  const raw = await callAI(
     apiKey,
     system,
     `Previous concepts already captured:\n${prevList}\n\nRecent transcript (last ~2-3 minutes):\n"${transcript}"`,
@@ -440,7 +349,7 @@ Output in this exact structure (use the same language as the transcript):
 
 Keep it SHORT and DENSE — this is a flashcard-style recap, not a full summary. Max 150 words total.`;
 
-  return callGemini(apiKey, system, `Transcript covering this concept:\n${transcript}`, {
+  return callAI(apiKey, system, `Transcript covering this concept:\n${transcript}`, {
     maxOutputTokens: 512,
     thinkingLevel: 'low',
   });
@@ -453,7 +362,7 @@ export async function detectTopicChange(apiKey, recentChunks, previousTopicLabel
 Respond with JSON only using this schema:
 {"changed": true/false, "topic": "short label", "summary": "brief explanation if changed"}`;
 
-  const raw = await callGemini(
+  const raw = await callAI(
     apiKey,
     system,
     `Previous topic: "${previousTopicLabel || 'none'}"\nTranscript: "${transcript}"`,
@@ -493,7 +402,7 @@ export async function answerQuestion(apiKey, question, relevantChunks, summaries
 ${crossSession ? 'The context may span multiple sessions, so explicitly mention which session the answer came from when relevant.' : ''}
 Reference timestamps when possible. Be precise. If the answer is not supported by the context, say so clearly.`;
 
-  return callGemini(
+  return callAI(
     apiKey,
     system,
     `Transcript:\n${context}${summaryCtx}\n\n---\nQuestion: ${question}`,
@@ -509,9 +418,9 @@ export async function generateSessionTitle(apiKey, chunks) {
   const text = chunks.slice(0, 30).map(c => c.text).join(' ').substring(0, 1500);
   const system = 'Generate a concise title for a recording session. Return only the title, 3 to 8 words, with no quotes or extra commentary.';
 
-  return callGemini(apiKey, system, `Transcript excerpt:\n"${text}"`, {
-    maxOutputTokens: 50,
-    thinkingLevel: 'minimal',
+  return callAI(apiKey, system, `Transcript excerpt:\n"${text}"`, {
+    maxOutputTokens: 1024,
+    thinkingLevel: 'low',
   });
 }
 
@@ -633,7 +542,7 @@ export async function generateNotes(apiKey, chunks, summaries = [], method = 'co
     prompt = `Generate comprehensive notes from this lecture transcript. Use BOTH the audio transcript AND the screen capture data to create thorough notes. The screen captures contain text, slides, diagrams, and visual content that supplement the spoken content.${summaryCtx}${screenCtx}\n\nFull transcript:\n${transcript}`;
   }
 
-  const content = await callGemini(apiKey, config.system, prompt, {
+  const content = await callAI(apiKey, config.system, prompt, {
     maxOutputTokens: 4096,
     thinkingLevel: 'medium',
   });
@@ -731,7 +640,7 @@ Return JSON only using this schema:
   }
 }`;
 
-  const raw = await callGemini(apiKey, system, `Transcript:
+  const raw = await callAI(apiKey, system, `Transcript:
 ${transcript}${screenCtx}`, {
     maxOutputTokens: 2048,
     thinkingLevel: 'medium',

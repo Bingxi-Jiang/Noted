@@ -1,3 +1,5 @@
+import { uploadToDrive } from './drive-upload.js';
+
 const app = document.getElementById('app');
 
 const ACCOUNT_STORAGE_KEY = 'scribe_accounts_v1';
@@ -27,6 +29,9 @@ const state = {
   showExportModal: false,
   showSpeakerModal: false,
   showSettingsModal: false,
+  aiSettings: null,
+  settingsDraft: null,
+  settingsBusy: false,
   exportFormat: 'pdf',
   exportDestination: 'download',
   exportBusy: false,
@@ -100,6 +105,7 @@ async function boot() {
   applyTheme();
   attachGlobalHandlers();
   await refreshSidebarData();
+  await loadModelSettings();
   scheduleRender();
 }
 
@@ -955,6 +961,84 @@ function renderMoveModal() {
 }
 
 
+async function loadModelSettings() {
+  try {
+    state.aiSettings = await api('/api/settings');
+    state.settingsDraft = structuredClone(state.aiSettings);
+  } catch (err) { showToast(`Could not load model settings: ${err.message}`, 'error'); }
+  scheduleRender();
+}
+
+function updateModelSetting(target) {
+  const draft = state.settingsDraft;
+  if (!draft) return;
+  const channel = target.dataset.channel;
+  const field = target.dataset.field;
+  if (channel) {
+    draft[channel][field] = target.value;
+    if (field === 'provider') {
+      draft[channel].model = state.aiSettings.providers[target.value].defaultModel;
+      scheduleRender();
+    }
+  } else draft[field] = target.value;
+}
+
+async function saveModelSettings() {
+  if (!state.settingsDraft || state.settingsBusy) return;
+  state.settingsBusy = true;
+  scheduleRender();
+  try {
+    state.aiSettings = await api('/api/settings', { method: 'PUT', body: JSON.stringify(state.settingsDraft) });
+    state.settingsDraft = structuredClone(state.aiSettings);
+    showToast('Settings saved. AI changes apply to new requests; transcription changes apply to the next recording.');
+  } finally { state.settingsBusy = false; scheduleRender(); }
+}
+
+function renderModelSettings() {
+  const draft = state.settingsDraft;
+  const info = state.aiSettings;
+  if (!draft || !info) return '<section class="settings-section">Model settings could not be loaded. Close and reopen Settings to retry.</section>';
+  return `
+    <section class="settings-section">
+      <div class="settings-section-head"><div>
+        <div class="settings-section-title">AI & transcription</div>
+        <div class="muted">Choose vision and text separately. Gemini is the default; OpenAI and Claude are optional.</div>
+      </div></div>
+      <div class="settings-key-status">${Object.values(info.providers).map(p => `<span class="mini-chip ${p.configured ? 'success' : ''}">${escapeHtml(p.label)} · ${p.configured ? 'Key configured' : 'Key missing'}</span>`).join('')}</div>
+      <fieldset class="model-fields" ${state.settingsBusy ? 'disabled' : ''}>
+      ${['text', 'vision'].map(channel => {
+        const selected = draft[channel];
+        const provider = info.providers[selected.provider];
+        return `<div class="field-row two-col">
+          <div class="field-group"><label class="field-label" for="${channel}-provider">${channel === 'text' ? 'Text generation' : 'Screenshot vision'} provider</label>
+            <select id="${channel}-provider" class="text-input" data-model="ai-settings-field" data-channel="${channel}" data-field="provider">${Object.entries(info.providers).map(([id, p]) => `<option value="${id}" ${id === selected.provider ? 'selected' : ''}>${escapeHtml(p.label)}</option>`).join('')}</select>
+          </div>
+          <div class="field-group"><label class="field-label" for="${channel}-model">Model ID</label>
+            <input id="${channel}-model" class="text-input" list="${channel}-models" data-model="ai-settings-field" data-channel="${channel}" data-field="model" value="${escapeAttr(selected.model)}" />
+            <datalist id="${channel}-models">${provider.models.map(m => `<option value="${escapeAttr(m)}"></option>`).join('')}</datalist>
+            <div class="muted">${provider.configured ? 'Ready to use.' : `Add ${escapeHtml(provider.keyEnv)} to .env and restart to use this provider.`}</div>
+          </div>
+        </div>`;
+      }).join('')}
+      <div class="field-row two-col">
+        <div class="field-group"><label class="field-label" for="deepgram-model">Deepgram model</label>
+          <select id="deepgram-model" class="text-input" data-model="ai-settings-field" data-channel="deepgram" data-field="model">${['nova-3', 'nova-2'].map(m => `<option value="${m}" ${draft.deepgram.model === m ? 'selected' : ''}>${m === 'nova-3' ? 'Nova-3 (recommended)' : 'Nova-2'}</option>`).join('')}</select>
+        </div>
+        <div class="field-group"><label class="field-label" for="deepgram-language">Transcription language</label>
+          <select id="deepgram-language" class="text-input" data-model="ai-settings-field" data-channel="deepgram" data-field="language">${[...new Set([draft.deepgram.language, 'en', 'zh', 'zh-TW', 'zh-HK', 'multi', 'es', 'ja', 'fr', 'de', 'ko'])].map(code => `<option value="${escapeAttr(code)}" ${draft.deepgram.language === code ? 'selected' : ''}>${escapeHtml(({en:'English',zh:'Mandarin (Simplified)','zh-TW':'Mandarin (Traditional)','zh-HK':'Cantonese',multi:'Multilingual (10 languages)',es:'Spanish',ja:'Japanese',fr:'French',de:'German',ko:'Korean'})[code] || code)}</option>`).join('')}</select>
+        </div>
+      </div>
+      <div class="muted">${info.deepgramConfigured ? 'Deepgram key configured.' : 'Add DEEPGRAM_API_KEY to .env and restart.'} The “multi” model does not include Chinese; choose Mandarin for Chinese recordings.</div>
+      <div class="settings-section-head" style="margin-top:20px"><div><div class="settings-section-title">Google Drive export</div></div></div>
+      <div class="field-group"><label class="field-label" for="google-client-id">Google OAuth Web client ID</label>
+        <input id="google-client-id" class="text-input" data-model="ai-settings-field" data-field="googleDriveClientId" value="${escapeAttr(draft.googleDriveClientId)}" placeholder="….apps.googleusercontent.com" />
+      </div>
+      <div class="muted">Save the client ID, then use Continue with Google below. Register <strong>${escapeHtml(location.origin)}</strong> as an authorized JavaScript origin in Google Cloud, enable the Drive API, and add your account as a test user if the OAuth app is in testing.</div>
+      </fieldset>
+      <div class="settings-actions-row"><button class="primary-btn" data-action="save-model-settings" ${state.settingsBusy ? 'disabled' : ''}>${state.settingsBusy ? 'Saving…' : 'Save AI & Drive settings'}</button></div>
+    </section>`;
+}
+
 function renderSettingsModal() {
   const activeAccount = getActiveAccount();
   const plans = [
@@ -969,11 +1053,12 @@ function renderSettingsModal() {
         <div class="modal-head">
           <div>
             <div class="modal-title">Settings</div>
-            <div class="muted" style="margin-top:6px;font-size:13px;">Manage accounts, plan, and theme here.</div>
+            <div class="muted" style="margin-top:6px;font-size:13px;">Choose AI models, configure Google Drive, and manage your preferences.</div>
           </div>
           <button class="icon-btn" data-action="close-settings">×</button>
         </div>
         <div class="modal-body custom-scrollbar settings-body">
+          ${renderModelSettings()}
           <section class="settings-section">
             <div class="settings-section-head">
               <div>
@@ -1268,7 +1353,11 @@ async function handleClick(event) {
         break;
       case 'open-settings':
         state.showSettingsModal = true;
+        await loadModelSettings();
         scheduleRender();
+        break;
+      case 'save-model-settings':
+        await saveModelSettings();
         break;
       case 'close-settings':
         state.showSettingsModal = false;
@@ -1316,6 +1405,7 @@ async function handleClick(event) {
 function handleInput(event) {
   const model = event.target.dataset.model;
   if (!model) return;
+  if (model === 'ai-settings-field') { updateModelSetting(event.target); return; }
 
   if (model === 'searchQuery') {
     state.searchQuery = event.target.value;
@@ -1364,7 +1454,7 @@ function handleInput(event) {
 }
 
 function handleChange(event) {
-  // Reserved for future granular controls.
+  if (event.target.dataset.model === 'ai-settings-field') updateModelSetting(event.target);
 }
 
 async function handleSubmit(event) {
@@ -1907,6 +1997,10 @@ async function openSessionSocket() {
           resolved = true;
           resolve();
         }
+        if (!resolved && message.type === 'error') {
+          resolved = true;
+          reject(new Error(message.data?.message || 'Transcription could not start.'));
+        }
       } catch (err) {
         console.warn('WS parse failed:', err);
       }
@@ -2199,9 +2293,11 @@ async function handleExport() {
   state.exportBusy = true;
   scheduleRender();
   try {
+    // Request OAuth from the Export click, before awaiting file generation.
+    const accessToken = state.exportDestination === 'drive' ? await ensureGoogleDriveAccessToken(getActiveAccount()) : null;
     const blob = await fetchExportBlob(state.exportFormat);
     if (state.exportDestination === 'drive') {
-      await uploadBlobToDrive(blob, `${sanitizeFilename(state.currentSession.title || 'session')}.${state.exportFormat}`);
+      await uploadBlobToDrive(blob, `${sanitizeFilename(state.currentSession.title || 'session')}.${state.exportFormat}`, accessToken);
       showToast('The file was uploaded to Google Drive.');
     } else {
       downloadBlob(blob, `${sanitizeFilename(state.currentSession.title || 'session')}.${state.exportFormat}`);
@@ -2223,27 +2319,14 @@ async function fetchExportBlob(format) {
   return response.blob();
 }
 
-async function uploadBlobToDrive(blob, filename) {
-  const activeAccount = getActiveAccount();
-  if (!activeAccount || activeAccount.type !== 'google') {
-    throw new Error('The active account is not a Google account, so upload to Google Drive is unavailable.');
-  }
-
-  const accessToken = await ensureGoogleDriveAccessToken(activeAccount);
-  const metadata = { name: filename };
-  const form = new FormData();
-  form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-  form.append('file', blob, filename);
-
-  const response = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${accessToken}` },
-    body: form,
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Google Drive upload failed: ${text}`);
+async function uploadBlobToDrive(blob, filename, accessToken) {
+  try { return await uploadToDrive(blob, filename, accessToken); }
+  catch (err) {
+    if (err.status === 401) {
+      delete state.authTokens[state.activeAccountId];
+      persistAuthTokens();
+    }
+    throw err;
   }
 }
 
@@ -3227,14 +3310,14 @@ async function addEmailAccount() {
 }
 
 function getGoogleClientId() {
-  const clientId = window.SCRIBE_CONFIG?.googleDriveClientId;
+  const clientId = state.aiSettings ? state.aiSettings.googleDriveClientId : window.SCRIBE_CONFIG?.googleDriveClientId;
   if (!clientId) throw new Error('Missing Google OAuth client ID configuration.');
   return clientId;
 }
 
 async function requestGoogleAccessToken({ prompt = 'select_account consent', loginHint = '' } = {}) {
   if (!window.google?.accounts?.oauth2) {
-    throw new Error('Google Identity Services has not finished loading yet.');
+    throw new Error('Google sign-in is still loading or blocked by the browser. Wait a moment and click again; allow accounts.google.com if using a blocker.');
   }
 
   const clientId = getGoogleClientId();
@@ -3253,7 +3336,7 @@ async function requestGoogleAccessToken({ prompt = 'select_account consent', log
         resolve(resp);
       },
       error_callback: (err) => {
-        reject(new Error(err?.type || 'The Google sign-in window did not complete successfully.'));
+        reject(new Error(err?.type === 'popup_failed_to_open' ? 'Google popup was blocked. Allow popups for this Noted page, then click again.' : err?.type === 'popup_closed' ? 'Google sign-in was closed. Click Continue with Google to try again.' : (err?.type || 'Google sign-in did not complete.')));
       },
     });
     tokenClient.requestAccessToken({ prompt, login_hint: loginHint || undefined });
@@ -3275,6 +3358,7 @@ async function addGoogleAccount() {
   scheduleRender();
   try {
     const tokenResponse = await requestGoogleAccessToken({ prompt: 'select_account consent' });
+    if (!tokenResponse.scope?.includes('https://www.googleapis.com/auth/drive.file')) throw new Error('Google Drive permission was not granted. Please reconnect and allow Drive export.');
     const profile = await fetchGoogleUserProfile(tokenResponse.access_token);
     const account = {
       id: `google:${profile.sub}`,
@@ -3308,17 +3392,18 @@ async function ensureGoogleDriveAccessToken(account) {
   }
 
   const existing = state.authTokens?.[account.id];
-  if (existing?.accessToken && Number(existing.expiresAt || 0) > Date.now() + 60_000) {
+  if (existing?.accessToken && existing.scope?.includes('https://www.googleapis.com/auth/drive.file') && Number(existing.expiresAt || 0) > Date.now() + 60_000) {
     return existing.accessToken;
   }
 
   const tokenResponse = await requestGoogleAccessToken({
     prompt: '',
     loginHint: account.email || account.sub || '',
-  }).catch(async () => requestGoogleAccessToken({
-    prompt: 'consent',
-    loginHint: account.email || account.sub || '',
-  }));
+  });
+
+  const profile = await fetchGoogleUserProfile(tokenResponse.access_token);
+  if (profile.sub !== account.sub) throw new Error('A different Google account was selected. Switch accounts in Settings before exporting.');
+  if (!tokenResponse.scope?.includes('https://www.googleapis.com/auth/drive.file')) throw new Error('Google Drive permission was not granted. Reconnect using Continue with Google.');
 
   state.authTokens[account.id] = {
     accessToken: tokenResponse.access_token,
